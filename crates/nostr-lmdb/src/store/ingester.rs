@@ -7,7 +7,7 @@ use std::thread;
 
 use heed::RwTxn;
 use nostr::nips::nip01::Coordinate;
-use nostr::{Event, Kind, Timestamp};
+use nostr::{Event, EventId, Kind};
 use nostr_database::{FlatBufferBuilder, RejectedReason, SaveEventStatus};
 use tokio::sync::oneshot;
 
@@ -16,6 +16,7 @@ use super::lmdb::Lmdb;
 
 pub(super) struct IngesterItem {
     event: Event,
+    scope: Option<String>,
     tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
 }
 
@@ -28,11 +29,13 @@ impl IngesterItem {
     #[must_use]
     pub(super) fn with_feedback(
         event: Event,
+        scope: Option<String>,
     ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 event,
+                scope,
                 tx: Some(tx),
             },
             rx,
@@ -68,9 +71,9 @@ impl Ingester {
             let mut fbb = FlatBufferBuilder::with_capacity(70_000);
 
             // Listen for items
-            while let Ok(IngesterItem { event, tx }) = self.rx.recv() {
+            while let Ok(IngesterItem { event, scope, tx }) = self.rx.recv() {
                 // Ingest
-                let res = self.ingest_event(event, &mut fbb);
+                let res = self.ingest_event(event, scope, &mut fbb);
 
                 // If sender is available send the `Result` otherwise log as error
                 match tx {
@@ -95,6 +98,7 @@ impl Ingester {
     fn ingest_event(
         &self,
         event: Event,
+        scope: Option<String>,
         fbb: &mut FlatBufferBuilder,
     ) -> nostr::Result<SaveEventStatus, Error> {
         if event.kind.is_ephemeral() {
@@ -107,19 +111,25 @@ impl Ingester {
             let read_txn = self.db.read_txn()?;
 
             // Already exists
-            if self.db.has_event(&read_txn, event.id.as_bytes())? {
+            if self
+                .db
+                .has_event_in_scope(&read_txn, scope.as_deref(), event.id.as_bytes())?
+            {
                 return Ok(SaveEventStatus::Rejected(RejectedReason::Duplicate));
             }
 
             // Reject event if ID was deleted
-            if self.db.is_deleted(&read_txn, &event.id)? {
+            if self.db.is_deleted(&read_txn, scope.as_deref(), &event.id)? {
                 return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
             }
 
             // Reject event if ADDR was deleted after it's created_at date
             // (non-parameterized or parameterized)
             if let Some(coordinate) = event.coordinate() {
-                if let Some(time) = self.db.when_is_coordinate_deleted(&read_txn, &coordinate)? {
+                if let Some(time) =
+                    self.db
+                        .when_is_coordinate_deleted(&read_txn, scope.as_deref(), &coordinate)?
+                {
                     if event.created_at <= time {
                         return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
                     }
@@ -134,24 +144,27 @@ impl Ingester {
 
         // Remove replaceable events being replaced
         if event.kind.is_replaceable() {
-            // Find replaceable event
-            if let Some(stored) = self
-                .db
-                .find_replaceable_event(&txn, &event.pubkey, event.kind)?
-            {
-                if stored.created_at > event.created_at {
+            if let Some(stored_event_borrow) = self.db.find_replaceable_event_in_txn(
+                &txn,
+                scope.as_deref(),
+                &event.pubkey,
+                event.kind,
+            )? {
+                if stored_event_borrow.created_at > event.created_at
+                    || (stored_event_borrow.created_at == event.created_at
+                        && stored_event_borrow.id > event.id.as_bytes())
+                {
                     txn.abort();
                     return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
                 }
-
-                // Acquire read txn
-                let read_txn = self.db.read_txn()?;
-
-                let coordinate: Coordinate = Coordinate::new(event.kind, event.pubkey);
+                // New event replaces stored_event_borrow, remove the old one
+                let id_to_remove = EventId::from_slice(stored_event_borrow.id).map_err(|_| {
+                    Error::Other(
+                        "Failed to parse EventId for replaceable event removal".to_string(),
+                    )
+                })?;
                 self.db
-                    .remove_replaceable(&read_txn, &mut txn, &coordinate, event.created_at)?;
-
-                read_txn.commit()?;
+                    .remove_event_in_scope(&mut txn, scope.as_deref(), &id_to_remove)?;
             }
         }
 
@@ -161,31 +174,33 @@ impl Ingester {
                 let coordinate: Coordinate =
                     Coordinate::new(event.kind, event.pubkey).identifier(identifier);
 
-                // Find param replaceable event
-                if let Some(stored) = self.db.find_addressable_event(&txn, &coordinate)? {
-                    if stored.created_at > event.created_at {
+                if let Some(stored_event_borrow) =
+                    self.db
+                        .find_addressable_event_in_txn(&txn, scope.as_deref(), &coordinate)?
+                {
+                    if stored_event_borrow.created_at > event.created_at
+                        || (stored_event_borrow.created_at == event.created_at
+                            && stored_event_borrow.id > event.id.as_bytes())
+                    {
                         txn.abort();
                         return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
                     }
-
-                    // Acquire read txn
-                    let read_txn = self.db.read_txn()?;
-
-                    self.db.remove_addressable(
-                        &read_txn,
-                        &mut txn,
-                        &coordinate,
-                        Timestamp::max(),
-                    )?;
-
-                    read_txn.commit()?;
+                    // New event replaces stored_event_borrow, remove the old one
+                    let id_to_remove =
+                        EventId::from_slice(stored_event_borrow.id).map_err(|_| {
+                            Error::Other(
+                                "Failed to parse EventId for addressable event removal".to_string(),
+                            )
+                        })?;
+                    self.db
+                        .remove_event_in_scope(&mut txn, scope.as_deref(), &id_to_remove)?;
                 }
             }
         }
 
         // Handle deletion events
         if let Kind::EventDeletion = event.kind {
-            let invalid: bool = self.handle_deletion_event(&mut txn, &event)?;
+            let invalid: bool = self.handle_deletion_event(&mut txn, &event, scope.as_deref())?;
 
             if invalid {
                 txn.abort();
@@ -194,7 +209,8 @@ impl Ingester {
         }
 
         // Store and index the event
-        self.db.store(&mut txn, fbb, &event)?;
+        self.db
+            .store_in_scope(&mut txn, scope.as_deref(), fbb, &event)?;
 
         // Commit
         txn.commit()?;
@@ -202,20 +218,28 @@ impl Ingester {
         Ok(SaveEventStatus::Success)
     }
 
-    fn handle_deletion_event(&self, txn: &mut RwTxn, event: &Event) -> nostr::Result<bool, Error> {
+    fn handle_deletion_event(
+        &self,
+        txn: &mut RwTxn,
+        event: &Event,
+        scope: Option<&str>,
+    ) -> nostr::Result<bool, Error> {
         // Acquire read txn
         let read_txn = self.db.read_txn()?;
 
         for id in event.tags.event_ids() {
-            if let Some(target) = self.db.get_event_by_id(&read_txn, id.as_bytes())? {
+            if let Some(target) = self.db.get_event_by_id_in_txn(&read_txn, scope, id)? {
                 // Author must match
                 if target.pubkey != event.pubkey.as_bytes() {
                     return Ok(true);
                 }
 
                 // Mark as deleted and remove event
-                self.db.mark_deleted(txn, id)?;
-                self.db.remove(txn, &target)?;
+                self.db.mark_deleted(txn, scope, id)?;
+                let target_id = EventId::from_slice(target.id).map_err(|_| {
+                    Error::Other("Invalid EventId slice from target event for deletion".to_string())
+                })?;
+                self.db.remove_event_in_scope(txn, scope, &target_id)?;
             }
         }
 
@@ -227,16 +251,37 @@ impl Ingester {
 
             // Mark deleted
             self.db
-                .mark_coordinate_deleted(txn, &coordinate.borrow(), event.created_at)?;
+                .mark_coordinate_deleted(txn, scope, &coordinate.borrow(), event.created_at)?;
 
-            // Remove events (up to the created_at of the deletion event)
-            if coordinate.kind.is_replaceable() {
-                self.db
-                    .remove_replaceable(&read_txn, txn, coordinate, event.created_at)?;
-            } else if coordinate.kind.is_addressable() {
-                self.db
-                    .remove_addressable(&read_txn, txn, coordinate, event.created_at)?;
+            // Remove events specified by the coordinate tag, at or before the deletion event's timestamp.
+            let found_events_for_coord = self.db.find_events_by_coordinate_scoped(
+                &read_txn, // Use read_txn for finding
+                scope,     // scope
+                coordinate,
+                event.created_at, // Delete events at or before the deletion event's timestamp
+            )?;
+
+            // Debug print
+            #[cfg(debug_assertions)]
+            tracing::debug!(
+                "Found {} events for coordinate {:?}:{}:{:?} (created_at <= {})",
+                found_events_for_coord.len(),
+                coordinate.kind,
+                coordinate.public_key,
+                coordinate.identifier,
+                event.created_at
+            );
+
+            for event_to_del_borrow in found_events_for_coord {
+                // Ensure we are deleting an event of the kind specified in the coordinate tag
+                if event_to_del_borrow.kind == coordinate.kind.as_u16() {
+                    let id_to_del = EventId::from_slice(event_to_del_borrow.id)
+                        .map_err(|_| Error::Other("Failed to parse EventId in handle_deletion_event for coordinate target".to_string()))?;
+                    self.db.remove_event_in_scope(txn, scope, &id_to_del)?;
+                    // Optional: self.db.mark_deleted(txn, scope, &id_to_del)?; if not already covered
+                }
             }
+            // The old remove_replaceable / remove_addressable calls are replaced by the loop above
         }
 
         read_txn.commit()?;

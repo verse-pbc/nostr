@@ -3,20 +3,22 @@ name = "nostr-lmdb"
 version = "0.41.0"
 edition = "2021"
 description = "LMDB storage backend for nostr apps"
-authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-license.workspace = true
+authors = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
 readme = "README.md"
 rust-version = "1.72.0"
 keywords = ["nostr", "database", "lmdb"]
 
 [dependencies]
-async-utility.workspace = true
+async-utility = { workspace = true }
+flatbuffers = "23.5.26"
 nostr = { workspace = true, features = ["std"] }
 nostr-database = { workspace = true, features = ["flatbuf"] }
+scoped-heed = "0.1.1"
 tokio = { workspace = true, features = ["sync"] }
-tracing.workspace = true
+tracing = { workspace = true }
 
 [target.'cfg(not(all(target_os = "macos", target_os = "ios")))'.dependencies]
 heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls"] }
@@ -26,5 +28,6 @@ heed = { version = "0.20", default-features = false, features = ["read-txn-no-tl
 heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls", "posix-sem"] }
 
 [dev-dependencies]
+nostr-sdk = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

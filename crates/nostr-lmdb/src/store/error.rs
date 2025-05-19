@@ -8,6 +8,7 @@ use std::{fmt, io};
 use async_utility::tokio::task::JoinError;
 use nostr::{key, secp256k1};
 use nostr_database::flatbuffers;
+use scoped_heed::ScopedDbError;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -28,6 +29,12 @@ pub enum Error {
     WrongEventKind,
     /// Not found
     NotFound,
+    /// Empty scope string
+    EmptyScope,
+    /// Error from scoped-heed crate
+    ScopedHeed(ScopedDbError),
+    /// Other error
+    Other(String),
 }
 
 impl std::error::Error for Error {}
@@ -45,6 +52,14 @@ impl fmt::Display for Error {
             Self::MpscSend => write!(f, "mpsc channel send error"),
             Self::NotFound => write!(f, "Not found"),
             Self::WrongEventKind => write!(f, "Wrong event kind"),
+            Self::EmptyScope => {
+                write!(
+                    f,
+                    "Empty scope string is not allowed. Use unscoped view for default access."
+                )
+            }
+            Self::ScopedHeed(e) => write!(f, "Scoped DB error: {e}"),
+            Self::Other(s) => write!(f, "{s}"),
         }
     }
 }
@@ -88,5 +103,11 @@ impl From<secp256k1::Error> for Error {
 impl From<oneshot::error::RecvError> for Error {
     fn from(e: oneshot::error::RecvError) -> Self {
         Self::OneshotRecv(e)
+    }
+}
+
+impl From<ScopedDbError> for Error {
+    fn from(e: ScopedDbError) -> Self {
+        Self::ScopedHeed(e)
     }
 }

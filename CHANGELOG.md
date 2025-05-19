@@ -25,6 +25,13 @@
 
 -->
 
+## Unreleased
+
+### Added
+
+* lmdb: add scoped database access support using `scoped-heed` library ([Daniel Cadenas])
+* lmdb: implement `NostrEventsDatabase` for `ScopedView` to enable namespace isolation and multi-tenancy ([Daniel Cadenas])
+
 ## v0.41.0 - 2025/04/15
 
 ### Breaking changes

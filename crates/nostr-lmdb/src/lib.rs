@@ -2,9 +2,108 @@
 // Copyright (c) 2023-2025 Rust Nostr Developers
 // Distributed under the MIT software license
 
-//! LMDB storage backend for nostr apps
+//! # NostrLMDB
+//!
+//! A Nostr database implementation using LMDB.
 //!
 //! Fork of [Pocket](https://github.com/mikedilger/pocket) database.
+//!
+//! ## Scoped Database Access
+//!
+//! NostrLMDB supports scoped database access, which allows multiple tenants to store and retrieve
+//! data in isolation within a single LMDB database file. Each scope has its own isolated data space,
+//! and operations in one scope do not affect data in another scope or the global (unscoped) space.
+//!
+//! ### The ScopedView Pattern
+//!
+//! NostrLMDB implements a ScopedView pattern that provides isolated database views for different tenants:
+//!
+//! - Each logical table uses `scoped_heed::ScopedBytesDatabase` internally
+//! - Scopes are implemented as prefixes to database keys
+//! - Nostr-specific codecs handle serialization/deserialization within scoped contexts
+//!
+//! ### Basic Usage
+//!
+//! ```no_run
+//! use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
+//! use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let db = NostrLMDB::open("./db")?;
+//!
+//! // Save an event in the "tenant_a" scope
+//! let tenant_a = db.scoped(Some("tenant_a"))?;
+//! tenant_a.save_event(&event).await?;
+//!
+//! // Query events in the "tenant_a" scope
+//! let filter = Filter::new();
+//! let events = tenant_a.query(filter.clone()).await?;
+//!
+//! // Access unscoped (legacy) data
+//! let legacy_events = db.query(filter).await?; // Direct call for unscoped
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Scope Isolation
+//!
+//! Data in different scopes is completely isolated. Operations in one scope do not affect data in
+//! another scope or the global (unscoped) space.
+//!
+//! ```no_run
+//! # use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
+//! # use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let db = NostrLMDB::open("./db")?;
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let filter = Filter::new();
+//! // These operations are completely isolated
+//! db.scoped(Some("tenant_a"))?.save_event(&event).await?;
+//! db.scoped(Some("tenant_b"))?.save_event(&event).await?;
+//!
+//! let tenant_a_events = db.scoped(Some("tenant_a"))?.query(filter.clone()).await?;
+//! let tenant_b_events = db.scoped(Some("tenant_b"))?.query(filter.clone()).await?;
+//! let global_events = db.query(filter).await?; // Direct call for unscoped
+//!
+//! // Each query only sees events in its own scope
+//! assert_eq!(tenant_a_events.len(), 1);
+//! assert_eq!(tenant_b_events.len(), 1);
+//! assert_eq!(global_events.len(), 0);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Implementation Details
+//!
+//! The scoped database functionality is implemented using:
+//!
+//! - `scoped_heed::ScopedBytesDatabase` for each logical table
+//! - Custom Nostr codecs that work with the scoped database
+//! - The `scoped()` method to create a new scoped view
+//!
+//! ### Backward Compatibility
+//!
+//! The existing NostrLMDB API continues to work with unscoped data. All existing code will
+//! continue to function without modification, operating on the global (unscoped) data space.
+//!
+//! ```no_run
+//! # use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
+//! # use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let db = NostrLMDB::open("./db")?;
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let filter = Filter::new();
+//! // API for unscoped data
+//! db.save_event(&event).await?;
+//! let events = db.query(filter.clone()).await?;
+//! // This is now the standard way to interact with unscoped data.
+//! # Ok(())
+//! # }
+//! ```
 
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
@@ -12,11 +111,31 @@
 
 use std::path::Path;
 
-use nostr_database::prelude::*;
+use nostr_database::prelude::{
+    BoxedFuture, CoordinateBorrow as NostrCoordinateBorrow, Event as NostrEvent,
+    EventId as NostrEventId, Filter as NostrFilter, Timestamp as NostrTimestamp,
+};
+pub use nostr_database::prelude::{Coordinate, CoordinateBorrow};
+pub use nostr_database::{
+    nostr, Backend, DatabaseError, DatabaseEventStatus, Events, NostrDatabase, NostrDatabaseWipe,
+    NostrEventsDatabase, RejectedReason, SaveEventStatus,
+};
 
 mod store;
 
 use self::store::Store;
+
+/// A view into a specific scope of the Nostr LMDB database.
+///
+/// This struct is created by the `scoped` or `unscoped` methods on `NostrLMDB`.
+/// It encapsulates a reference to the main database (`db`) and an optional scope name (`scope`).
+/// If `scope` is `Some(String)`, operations are performed within that named scope.
+/// If `scope` is `None`, operations are performed in the global/unscoped context.
+#[derive(Debug)]
+pub struct ScopedView<'a> {
+    db: &'a NostrLMDB,
+    scope: Option<String>,
+}
 
 /// LMDB Nostr Database
 #[derive(Debug)]
@@ -47,7 +166,7 @@ impl NostrDatabase for NostrLMDB {
 impl NostrEventsDatabase for NostrLMDB {
     fn save_event<'a>(
         &'a self,
-        event: &'a Event,
+        event: &'a NostrEvent,
     ) -> BoxedFuture<'a, Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
             self.db
@@ -59,7 +178,7 @@ impl NostrEventsDatabase for NostrLMDB {
 
     fn check_id<'a>(
         &'a self,
-        event_id: &'a EventId,
+        event_id: &'a NostrEventId,
     ) -> BoxedFuture<'a, Result<DatabaseEventStatus, DatabaseError>> {
         Box::pin(async move {
             if self
@@ -82,8 +201,8 @@ impl NostrEventsDatabase for NostrLMDB {
 
     fn has_coordinate_been_deleted<'a>(
         &'a self,
-        coordinate: &'a CoordinateBorrow<'a>,
-        timestamp: &'a Timestamp,
+        coordinate: &'a NostrCoordinateBorrow<'a>,
+        timestamp: &'a NostrTimestamp,
     ) -> BoxedFuture<'a, Result<bool, DatabaseError>> {
         Box::pin(async move {
             if let Some(t) = self
@@ -100,8 +219,8 @@ impl NostrEventsDatabase for NostrLMDB {
 
     fn event_by_id<'a>(
         &'a self,
-        event_id: &'a EventId,
-    ) -> BoxedFuture<'a, Result<Option<Event>, DatabaseError>> {
+        event_id: &'a NostrEventId,
+    ) -> BoxedFuture<'a, Result<Option<NostrEvent>, DatabaseError>> {
         Box::pin(async move {
             self.db
                 .get_event_by_id(event_id)
@@ -109,18 +228,18 @@ impl NostrEventsDatabase for NostrLMDB {
         })
     }
 
-    fn count(&self, filter: Filter) -> BoxedFuture<Result<usize, DatabaseError>> {
+    fn count(&self, filter: NostrFilter) -> BoxedFuture<Result<usize, DatabaseError>> {
         Box::pin(async move { self.db.count(filter).map_err(DatabaseError::backend) })
     }
 
-    fn query(&self, filter: Filter) -> BoxedFuture<Result<Events, DatabaseError>> {
+    fn query(&self, filter: NostrFilter) -> BoxedFuture<Result<Events, DatabaseError>> {
         Box::pin(async move { self.db.query(filter).map_err(DatabaseError::backend) })
     }
 
     fn negentropy_items(
         &self,
-        filter: Filter,
-    ) -> BoxedFuture<Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
+        filter: NostrFilter,
+    ) -> BoxedFuture<Result<Vec<(NostrEventId, NostrTimestamp)>, DatabaseError>> {
         Box::pin(async move {
             self.db
                 .negentropy_items(filter)
@@ -128,7 +247,7 @@ impl NostrEventsDatabase for NostrLMDB {
         })
     }
 
-    fn delete(&self, filter: Filter) -> BoxedFuture<Result<(), DatabaseError>> {
+    fn delete(&self, filter: NostrFilter) -> BoxedFuture<Result<(), DatabaseError>> {
         Box::pin(async move { self.db.delete(filter).await.map_err(DatabaseError::backend) })
     }
 }
@@ -140,6 +259,158 @@ impl NostrDatabaseWipe for NostrLMDB {
     }
 }
 
+impl NostrEventsDatabase for ScopedView<'_> {
+    fn save_event<'b>(
+        &'b self,
+        event: &'b NostrEvent,
+    ) -> BoxedFuture<'b, Result<SaveEventStatus, DatabaseError>> {
+        Box::pin(async move { self.save_event(event).await })
+    }
+
+    fn check_id<'b>(
+        &'b self,
+        event_id: &'b NostrEventId,
+    ) -> BoxedFuture<'b, Result<DatabaseEventStatus, DatabaseError>> {
+        Box::pin(async move {
+            // TODO: Add `event_is_deleted_in_scope` to `Store` to accurately reflect deletion status.
+            match self.event_by_id(*event_id).await? {
+                Some(_) => Ok(DatabaseEventStatus::Saved),
+                None => Ok(DatabaseEventStatus::NotExistent),
+            }
+        })
+    }
+
+    fn has_coordinate_been_deleted<'b>(
+        &'b self,
+        coordinate: &'b NostrCoordinateBorrow,
+        timestamp: &'b NostrTimestamp,
+    ) -> BoxedFuture<'b, Result<bool, DatabaseError>> {
+        // Falls back to unscoped version - requires Store API update for scoped support
+        Box::pin(async move {
+            self.db
+                .has_coordinate_been_deleted(coordinate, timestamp)
+                .await
+        })
+    }
+
+    fn event_by_id<'b>(
+        &'b self,
+        event_id: &'b NostrEventId,
+    ) -> BoxedFuture<'b, Result<Option<NostrEvent>, DatabaseError>> {
+        Box::pin(async move { self.event_by_id(*event_id).await })
+    }
+
+    fn count(&self, filter: NostrFilter) -> BoxedFuture<Result<usize, DatabaseError>> {
+        Box::pin(async move { self.count(filter).await })
+    }
+
+    fn query(&self, filter: NostrFilter) -> BoxedFuture<Result<Events, DatabaseError>> {
+        Box::pin(async move {
+            let events_vec = self.query(filter.clone()).await?;
+            // Convert Vec<NostrEvent> to nostr_database::Events
+            // The filter passed to Events::new is only used for the limit, which we don't apply here.
+            // If nostr_database::Events changes its constructor or behavior, this might need adjustment.
+            let mut events_collection = Events::new(&NostrFilter::default());
+            for event in events_vec {
+                events_collection.insert(event);
+            }
+            Ok(events_collection)
+        })
+    }
+
+    fn negentropy_items(
+        &self,
+        filter: NostrFilter,
+    ) -> BoxedFuture<Result<Vec<(NostrEventId, NostrTimestamp)>, DatabaseError>> {
+        // Falls back to unscoped version - requires Store API update for scoped support
+        Box::pin(async move { self.db.negentropy_items(filter).await })
+    }
+
+    fn delete(&self, filter: NostrFilter) -> BoxedFuture<'_, Result<(), DatabaseError>> {
+        Box::pin(async move { self.delete(filter).await })
+    }
+}
+
+impl NostrLMDB {
+    /// Create a scoped view for database operations
+    ///
+    /// - If `scope_name` is `Some(name)`:
+    ///   - If `name` is not empty, a view for the named scope `name` is created.
+    ///   - If `name` is empty, an error is returned.
+    /// - If `scope_name` is `None`, a view for unscoped (global) operations is created.
+    pub fn scoped(&self, scope_name: Option<&str>) -> Result<ScopedView<'_>, DatabaseError> {
+        if let Some(s) = scope_name {
+            if s.is_empty() {
+                return Err(DatabaseError::Backend(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Scope name cannot be empty if Some(scope_name) is provided.",
+                ))));
+            }
+        }
+        let view = ScopedView {
+            db: self,
+            scope: scope_name.map(|s| s.to_string()),
+        };
+        Ok(view)
+    }
+}
+
+impl ScopedView<'_> {
+    /// Returns the name of the scope, if this view is scoped.
+    /// Returns `None` if this is an unscoped (global) view.
+    pub fn scope_name(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    /// Save an event within the view's scope.
+    pub async fn save_event(&self, event: &NostrEvent) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .db
+            .save_event_in_scope(self.scope.as_deref(), event.clone())
+            .await
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Get an event by ID from the view's scope.
+    pub async fn event_by_id(
+        &self,
+        event_id: NostrEventId,
+    ) -> Result<Option<NostrEvent>, DatabaseError> {
+        self.db
+            .db
+            .event_by_id_in_scope(self.scope.as_deref(), event_id)
+            .await
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Query events within the view's scope.
+    pub async fn query(&self, filter: NostrFilter) -> Result<Vec<NostrEvent>, DatabaseError> {
+        self.db
+            .db
+            .query_in_scope(self.scope.as_deref(), filter)
+            .await
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Delete events matching the filter within the view's scope.
+    pub async fn delete(&self, filter: NostrFilter) -> Result<(), DatabaseError> {
+        self.db
+            .db
+            .delete_in_scope(self.scope.as_deref(), filter)
+            .await
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Count events matching the filter within the view's scope.
+    pub async fn count(&self, filter: NostrFilter) -> Result<usize, DatabaseError> {
+        self.db
+            .db
+            .count_in_scope(self.scope.as_deref(), filter)
+            .await
+            .map_err(DatabaseError::backend)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
@@ -147,7 +418,16 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::*;
+    use crate::nostr::{
+        Event, EventBuilder, Filter, JsonUtil, Keys, Kind, Metadata, Tag, Timestamp,
+    };
+    use crate::{
+        Coordinate, // Now available as crate::Coordinate
+        DatabaseError,
+        NostrEventsDatabase,
+        NostrLMDB,
+        SaveEventStatus,
+    };
 
     const EVENTS: [&str; 14] = [
         r#"{"id":"b7b1fb52ad8461a03e949820ae29a9ea07e35bcd79c95c4b59b0254944f62805","pubkey":"aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4","created_at":1704644581,"kind":1,"tags":[],"content":"Text note","sig":"ed73a8a4e7c26cd797a7b875c634d9ecb6958c57733305fed23b978109d0411d21b3e182cb67c8ad750884e30ca383b509382ae6187b36e76ee76e6a142c4284"}"#,
@@ -289,7 +569,7 @@ mod tests {
 
         // Test filter query
         let events = db
-            .query(Filter::new().author(keys.public_key).kind(Kind::Metadata))
+            .query(Filter::new().author(keys.public_key()).kind(Kind::Metadata))
             .await
             .unwrap();
         assert_eq!(events.to_vec(), vec![expected_event.clone()]);
@@ -319,7 +599,7 @@ mod tests {
 
         // Test filter query
         let events = db
-            .query(Filter::new().author(keys.public_key).kind(Kind::Metadata))
+            .query(Filter::new().author(keys.public_key()).kind(Kind::Metadata))
             .await
             .unwrap();
         assert_eq!(events.to_vec(), vec![new_expected_event]);
@@ -343,7 +623,8 @@ mod tests {
                     .custom_created_at(now - Duration::from_secs(120)),
             )
             .await;
-        let coordinate = Coordinate::new(Kind::from(33_333), keys.public_key).identifier("my-id-a");
+        let coordinate =
+            Coordinate::new(Kind::from(33_333), keys.public_key()).identifier("my-id-a");
 
         // Test event by ID
         let event = db.event_by_id(&expected_event.id).await.unwrap().unwrap();
@@ -423,9 +704,16 @@ mod tests {
     async fn test_expected_query_result() {
         let db = TempDatabase::new();
 
-        for event in EVENTS.into_iter() {
-            let event = Event::from_json(event).unwrap();
-            let _ = db.save_event(&event).await;
+        for (idx, event_str) in EVENTS.into_iter().enumerate() {
+            let event = Event::from_json(event_str).unwrap();
+            let status = db.save_event(&event).await;
+            if let Ok(status) = status {
+                // Invalid deletions (Event 7 and 11) should be rejected
+                if idx == 7 || idx == 11 {
+                    println!("Event {} status: {:?}", idx, status);
+                    assert!(!status.is_success(), "Event {} should be rejected", idx);
+                }
+            }
         }
 
         // Test expected output
@@ -465,5 +753,177 @@ mod tests {
         db.delete(filter).await.unwrap();
 
         assert_eq!(db.count_all().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_view_delete() {
+        let db = TempDatabase::new();
+
+        let scope1_name = "scope1";
+        let scope2_name = "scope2";
+
+        let view_s1 = db.scoped(Some(scope1_name)).unwrap();
+        let view_s2 = db.scoped(Some(scope2_name)).unwrap();
+
+        let keys_a = Keys::generate();
+        let keys_b = Keys::generate();
+        let keys_c = Keys::generate();
+        let keys_d = Keys::generate();
+
+        // Events for scope1
+        let event1_s1 = EventBuilder::text_note("S1E1 Text Note by A")
+            .sign_with_keys(&keys_a)
+            .unwrap();
+        let event2_s1 = EventBuilder::text_note("S1E2 Text Note by B")
+            .sign_with_keys(&keys_b)
+            .unwrap();
+        let event3_s1_k2 = EventBuilder::new(Kind::Custom(12222), "S1E3K2 Custom by A")
+            .sign_with_keys(&keys_a)
+            .unwrap();
+
+        // Events for scope2
+        let event1_s2 = EventBuilder::text_note("S2E1 Text Note by A")
+            .sign_with_keys(&keys_a)
+            .unwrap(); // Same author as event1_s1
+        let event2_s2 = EventBuilder::text_note("S2E2 Text Note by C")
+            .sign_with_keys(&keys_c)
+            .unwrap();
+
+        // Event for unscoped
+        let event_unscoped = EventBuilder::text_note("UNSC Text Note by D")
+            .sign_with_keys(&keys_d)
+            .unwrap();
+
+        // Save events
+        view_s1.save_event(&event1_s1).await.unwrap();
+        view_s1.save_event(&event2_s1).await.unwrap();
+        view_s1.save_event(&event3_s1_k2).await.unwrap();
+
+        view_s2.save_event(&event1_s2).await.unwrap();
+        view_s2.save_event(&event2_s2).await.unwrap();
+
+        db.save_event(&event_unscoped).await.unwrap();
+
+        // Initial state verification
+        let s1_events_initial = view_s1.query(Filter::new()).await.unwrap();
+        assert_eq!(s1_events_initial.len(), 3);
+        assert!(s1_events_initial.contains(&event1_s1));
+        assert!(s1_events_initial.contains(&event2_s1));
+        assert!(s1_events_initial.contains(&event3_s1_k2));
+
+        let s2_events_initial = view_s2.query(Filter::new()).await.unwrap();
+        assert_eq!(s2_events_initial.len(), 2);
+        assert!(s2_events_initial.contains(&event1_s2));
+        assert!(s2_events_initial.contains(&event2_s2));
+
+        let unscoped_events_initial = db.query(Filter::new()).await.unwrap();
+        assert_eq!(unscoped_events_initial.len(), 1);
+        assert!(unscoped_events_initial.contains(&event_unscoped));
+
+        // --- Test Deletion by ID ---
+        view_s1
+            .delete(Filter::new().id(event1_s1.id))
+            .await
+            .unwrap();
+
+        // Verify event1_s1 is gone from scope1
+        let s1_events_after_del_id = view_s1.query(Filter::new()).await.unwrap();
+        assert_eq!(s1_events_after_del_id.len(), 2);
+        assert!(!s1_events_after_del_id.contains(&event1_s1));
+        assert!(s1_events_after_del_id.contains(&event2_s1));
+        assert!(s1_events_after_del_id.contains(&event3_s1_k2));
+
+        // Verify scope2 is unaffected
+        let s2_events_after_del_id_s1 = view_s2.query(Filter::new()).await.unwrap();
+        assert_eq!(s2_events_after_del_id_s1.len(), 2);
+        assert!(s2_events_after_del_id_s1.contains(&event1_s2));
+
+        // Verify unscoped is unaffected
+        let unscoped_events_after_del_id_s1 = db.query(Filter::new()).await.unwrap();
+        assert_eq!(unscoped_events_after_del_id_s1.len(), 1);
+        assert!(unscoped_events_after_del_id_s1.contains(&event_unscoped));
+
+        // --- Test Deletion by Author ---
+        // Delete all events by author A from scope1. event3_s1_k2 should be deleted.
+        view_s1
+            .delete(Filter::new().author(keys_a.public_key()))
+            .await
+            .unwrap();
+
+        let s1_events_after_del_author_a = view_s1.query(Filter::new()).await.unwrap();
+        assert_eq!(s1_events_after_del_author_a.len(), 1); // Only event2_s1 (by B) should remain
+        assert!(s1_events_after_del_author_a.contains(&event2_s1));
+        assert!(!s1_events_after_del_author_a.contains(&event1_s1));
+        assert!(!s1_events_after_del_author_a.contains(&event3_s1_k2));
+
+        // Verify event1_s2 (by author A) in scope2 is unaffected
+        let s2_events_after_del_author_a_s1 = view_s2.query(Filter::new()).await.unwrap();
+        assert_eq!(s2_events_after_del_author_a_s1.len(), 2); // Should still have event1_s2 and event2_s2
+        assert!(s2_events_after_del_author_a_s1.contains(&event1_s2));
+
+        // --- Test Deletion by Kind in a specific scope ---
+        // Add a new event to scope2 to test kind deletion
+        let event3_s2_k_custom = EventBuilder::new(Kind::Custom(12222), "S2E3K_CUSTOM Custom by C")
+            .sign_with_keys(&keys_c)
+            .unwrap();
+        view_s2.save_event(&event3_s2_k_custom).await.unwrap();
+        assert_eq!(view_s2.query(Filter::new()).await.unwrap().len(), 3); // event1_s2, event2_s2, event3_s2_k_custom
+
+        // Delete Kind::Custom(12222) from scope2
+        view_s2
+            .delete(Filter::new().kind(Kind::Custom(12222)))
+            .await
+            .unwrap();
+        let s2_events_after_del_kind = view_s2.query(Filter::new()).await.unwrap();
+        assert_eq!(s2_events_after_del_kind.len(), 2); // event1_s2 (textnote), event2_s2 (textnote) should remain
+        assert!(!s2_events_after_del_kind.contains(&event3_s2_k_custom));
+        assert!(s2_events_after_del_kind.contains(&event1_s2));
+        assert!(s2_events_after_del_kind.contains(&event2_s2));
+
+        // Verify scope1 (which had an event of Kind::Custom(12222) by author A - event3_s1_k2, now deleted) is not further affected by s2 deletion
+        let s1_final_check = view_s1.query(Filter::new()).await.unwrap();
+        assert_eq!(s1_final_check.len(), 1); // Should still only have event2_s1
+        assert!(s1_final_check.contains(&event2_s1));
+
+        // --- Test deleting all events in a scope ---
+        let view_s1_all_count = view_s1.query(Filter::new()).await.unwrap().len();
+        assert_eq!(view_s1_all_count, 1); // event2_s1 remains
+
+        view_s1.delete(Filter::new()).await.unwrap(); // Delete all from scope1
+        assert_eq!(view_s1.query(Filter::new()).await.unwrap().len(), 0);
+
+        // Ensure scope2 and unscoped are not affected
+        assert_eq!(view_s2.query(Filter::new()).await.unwrap().len(), 2);
+        assert_eq!(db.query(Filter::new()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_nostr_lmdb_scoped_methods() {
+        let db = TempDatabase::new();
+
+        // Test successful creation of a named scoped view
+        let scoped_view_res = db.scoped(Some("test_scope"));
+        assert!(scoped_view_res.is_ok());
+        let _scoped_view = scoped_view_res.unwrap();
+
+        // Test successful creation of an unscoped view
+        let unscoped_view_res = db.scoped(None);
+        assert!(unscoped_view_res.is_ok());
+        let _unscoped_view = unscoped_view_res.unwrap();
+        assert!(_unscoped_view.scope.is_none());
+
+        // Test creating a scoped view with an empty string inside Some()
+        let empty_scope_res = db.scoped(Some(""));
+        assert!(empty_scope_res.is_err());
+        match empty_scope_res.err().unwrap() {
+            DatabaseError::Backend(e) => {
+                // Compare the error message string
+                assert_eq!(
+                    e.to_string(),
+                    "Scope name cannot be empty if Some(scope_name) is provided."
+                );
+            }
+            _ => panic!("Expected DatabaseError::Backend for empty scope name in Some()"),
+        }
     }
 }
