@@ -6,7 +6,7 @@
 use std::{fmt, io};
 
 use async_utility::tokio::task::JoinError;
-use nostr::{key, secp256k1};
+use nostr::{event::Error as NostrEventError, key, secp256k1};
 use nostr_database::flatbuffers;
 use scoped_heed::ScopedDbError;
 use tokio::sync::oneshot;
@@ -33,6 +33,8 @@ pub enum Error {
     EmptyScope,
     /// Error from scoped-heed crate
     ScopedHeed(ScopedDbError),
+    /// Nostr Event error
+    NostrEvent(NostrEventError),
     /// Other error
     Other(String),
 }
@@ -59,6 +61,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::ScopedHeed(e) => write!(f, "Scoped DB error: {e}"),
+            Self::NostrEvent(e) => write!(f, "Nostr event error: {e}"),
             Self::Other(s) => write!(f, "{s}"),
         }
     }
@@ -109,5 +112,11 @@ impl From<oneshot::error::RecvError> for Error {
 impl From<ScopedDbError> for Error {
     fn from(e: ScopedDbError) -> Self {
         Self::ScopedHeed(e)
+    }
+}
+
+impl From<NostrEventError> for Error {
+    fn from(e: NostrEventError) -> Self {
+        Self::NostrEvent(e)
     }
 }

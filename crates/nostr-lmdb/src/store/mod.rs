@@ -9,6 +9,7 @@ use std::sync::mpsc::Sender;
 
 use async_utility::task;
 use nostr_database::prelude::*;
+use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod error;
 mod ingester;
@@ -39,6 +40,16 @@ impl Store {
         let ingester: Sender<IngesterItem> = Ingester::run(db.clone());
 
         Ok(Self { db, ingester })
+    }
+    
+    /// Create a GlobalScopeRegistry for this store
+    pub fn create_registry(&self) -> Result<Option<std::sync::Arc<GlobalScopeRegistry>>, Error> {
+        self.db.create_registry()
+    }
+    
+    /// Register a scope in the registry
+    pub fn register_scope(&self, registry: &std::sync::Arc<GlobalScopeRegistry>, scope: &scoped_heed::Scope) -> Result<(), Error> {
+        self.db.register_scope(registry, scope)
     }
 
     #[inline]
@@ -79,7 +90,7 @@ impl Store {
     /// Is the event deleted
     pub fn event_is_deleted(&self, id: &EventId) -> Result<bool, Error> {
         let txn = self.db.read_txn()?;
-        let deleted: bool = self.db.is_deleted(&txn, None, id)?;
+        let deleted: bool = self.db.is_deleted(&txn, &Scope::Default, id)?;
         txn.commit()?;
         Ok(deleted)
     }
@@ -90,7 +101,7 @@ impl Store {
         coordinate: &'a CoordinateBorrow<'a>,
     ) -> Result<Option<Timestamp>, Error> {
         let txn = self.db.read_txn()?;
-        let when = self.db.when_is_coordinate_deleted(&txn, None, coordinate)?;
+        let when = self.db.when_is_coordinate_deleted(&txn, &Scope::Default, coordinate)?;
         txn.commit()?;
         Ok(when)
     }
@@ -143,31 +154,35 @@ impl Store {
     }
 
     // New scope-aware methods
-    pub async fn delete_in_scope(&self, scope: Option<&str>, filter: Filter) -> Result<(), Error> {
+    pub async fn delete_in_scope(&self, scope: &Scope, filter: Filter) -> Result<(), Error> {
         let internal_sv = match scope {
-            Some(s_name) => {
-                if s_name.is_empty() {
+            Scope::Named { name, .. } => {
+                if name.is_empty() {
                     return Err(Error::EmptyScope);
                 }
-                self.db.scoped(s_name) // self.db is Lmdb
+                self.db.scoped(name) // self.db is Lmdb
             }
-            None => self.db.unscoped(),
+            Scope::Default => self.db.unscoped(),
         };
         internal_sv.delete(filter).await // Calls the new async delete on internal ScopedView
     }
 
     pub async fn save_event_in_scope(
         &self,
-        scope: Option<&str>,
+        scope: &Scope,
         event: Event,
     ) -> Result<SaveEventStatus, Error> {
-        if let Some(s_name) = scope {
-            if s_name.is_empty() {
-                return Err(Error::EmptyScope);
+        // Convert Scope to Option<String> for the ingester
+        let scope_string = match scope {
+            Scope::Named { name, .. } => {
+                if name.is_empty() {
+                    return Err(Error::EmptyScope);
+                }
+                Some(name.clone())
             }
-        }
-
-        let scope_string = scope.map(|s| s.to_string());
+            Scope::Default => None,
+        };
+        
         let (item, rx) = IngesterItem::with_feedback(event, scope_string);
 
         // Send to the ingester
@@ -179,23 +194,21 @@ impl Store {
 
     pub async fn query_in_scope(
         &self,
-        scope: Option<&str>,
+        scope: &Scope,
         filter: Filter,
     ) -> Result<Vec<Event>, Error> {
-        if let Some(s_name) = scope {
-            if s_name.is_empty() {
-                return Err(Error::EmptyScope);
-            }
-        }
         let db_clone = self.db.clone();
-        let scope_string = scope.map(|s| s.to_string());
+        let scope_clone = scope.clone();
+        
         task::spawn_blocking(move || {
-            let internal_sv = match scope_string.as_deref() {
-                Some(s_name) => {
-                    // Empty check moved outside spawn_blocking
-                    db_clone.scoped(s_name)
+            let internal_sv = match &scope_clone {
+                Scope::Named { name, .. } => {
+                    if name.is_empty() {
+                        return Err(Error::EmptyScope);
+                    }
+                    db_clone.scoped(name)
                 }
-                None => db_clone.unscoped(),
+                Scope::Default => db_clone.unscoped(),
             };
             internal_sv.query(filter)
         })
@@ -204,23 +217,21 @@ impl Store {
 
     pub async fn event_by_id_in_scope(
         &self,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: EventId,
     ) -> Result<Option<Event>, Error> {
-        if let Some(s_name) = scope {
-            if s_name.is_empty() {
-                return Err(Error::EmptyScope);
-            }
-        }
         let db_clone = self.db.clone();
-        let scope_string = scope.map(|s| s.to_string());
+        let scope_clone = scope.clone();
+        
         task::spawn_blocking(move || {
-            let internal_sv = match scope_string.as_deref() {
-                Some(s_name) => {
-                    // Empty check moved outside spawn_blocking
-                    db_clone.scoped(s_name)
+            let internal_sv = match &scope_clone {
+                Scope::Named { name, .. } => {
+                    if name.is_empty() {
+                        return Err(Error::EmptyScope);
+                    }
+                    db_clone.scoped(name)
                 }
-                None => db_clone.unscoped(),
+                Scope::Default => db_clone.unscoped(),
             };
             internal_sv.event_by_id(&event_id)
         })
@@ -229,20 +240,21 @@ impl Store {
 
     pub async fn count_in_scope(
         &self,
-        scope: Option<&str>,
+        scope: &Scope,
         filter: Filter,
     ) -> Result<usize, Error> {
-        if let Some(s_name) = scope {
-            if s_name.is_empty() {
-                return Err(Error::EmptyScope);
-            }
-        }
         let db_clone = self.db.clone();
-        let scope_string = scope.map(|s| s.to_string());
+        let scope_clone = scope.clone();
+        
         task::spawn_blocking(move || {
-            let internal_sv = match scope_string.as_deref() {
-                Some(s_name) => db_clone.scoped(s_name),
-                None => db_clone.unscoped(),
+            let internal_sv = match &scope_clone {
+                Scope::Named { name, .. } => {
+                    if name.is_empty() {
+                        return Err(Error::EmptyScope);
+                    }
+                    db_clone.scoped(name)
+                }
+                Scope::Default => db_clone.unscoped(),
             };
             match internal_sv.count(filter) {
                 Ok(count_val) => Ok(count_val),

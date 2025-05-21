@@ -120,6 +120,7 @@ pub use nostr_database::{
     nostr, Backend, DatabaseError, DatabaseEventStatus, Events, NostrDatabase, NostrDatabaseWipe,
     NostrEventsDatabase, RejectedReason, SaveEventStatus,
 };
+pub use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod store;
 
@@ -134,13 +135,14 @@ use self::store::Store;
 #[derive(Debug)]
 pub struct ScopedView<'a> {
     db: &'a NostrLMDB,
-    scope: Option<String>,
+    scope: Scope,
 }
 
 /// LMDB Nostr Database
 #[derive(Debug)]
 pub struct NostrLMDB {
     db: Store,
+    registry: Option<std::sync::Arc<GlobalScopeRegistry>>,
 }
 
 impl NostrLMDB {
@@ -150,8 +152,12 @@ impl NostrLMDB {
     where
         P: AsRef<Path>,
     {
+        let store = Store::open(path).map_err(DatabaseError::backend)?;
+        let registry = store.create_registry().map_err(DatabaseError::backend)?;
+        
         Ok(Self {
-            db: Store::open(path).map_err(DatabaseError::backend)?,
+            db: store,
+            registry,
         })
     }
 }
@@ -339,19 +345,46 @@ impl NostrLMDB {
     ///   - If `name` is empty, an error is returned.
     /// - If `scope_name` is `None`, a view for unscoped (global) operations is created.
     pub fn scoped(&self, scope_name: Option<&str>) -> Result<ScopedView<'_>, DatabaseError> {
-        if let Some(s) = scope_name {
-            if s.is_empty() {
+        let scope = match scope_name {
+            Some(name) if !name.is_empty() => {
+                // Create a named scope
+                let scope = Scope::named(name).map_err(|e| {
+                    DatabaseError::Backend(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Failed to create scope: {}", e),
+                    )))
+                })?;
+                
+                // Register the scope in the registry if available
+                if let Some(registry) = &self.registry {
+                    // We need to get a write transaction from the database
+                    self.db.register_scope(registry, &scope).map_err(DatabaseError::backend)?;
+                }
+                
+                scope
+            }
+            Some(_) => {
                 return Err(DatabaseError::Backend(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Scope name cannot be empty if Some(scope_name) is provided.",
                 ))));
             }
-        }
+            None => Scope::Default,
+        };
+        
         let view = ScopedView {
             db: self,
-            scope: scope_name.map(|s| s.to_string()),
+            scope,
         };
         Ok(view)
+    }
+    
+    /// Create a view for the default (unscoped) database
+    pub fn unscoped(&self) -> ScopedView<'_> {
+        ScopedView {
+            db: self,
+            scope: Scope::Default,
+        }
     }
 }
 
@@ -359,14 +392,14 @@ impl ScopedView<'_> {
     /// Returns the name of the scope, if this view is scoped.
     /// Returns `None` if this is an unscoped (global) view.
     pub fn scope_name(&self) -> Option<&str> {
-        self.scope.as_deref()
+        self.scope.name()
     }
 
     /// Save an event within the view's scope.
     pub async fn save_event(&self, event: &NostrEvent) -> Result<SaveEventStatus, DatabaseError> {
         self.db
             .db
-            .save_event_in_scope(self.scope.as_deref(), event.clone())
+            .save_event_in_scope(&self.scope, event.clone())
             .await
             .map_err(DatabaseError::backend)
     }
@@ -378,7 +411,7 @@ impl ScopedView<'_> {
     ) -> Result<Option<NostrEvent>, DatabaseError> {
         self.db
             .db
-            .event_by_id_in_scope(self.scope.as_deref(), event_id)
+            .event_by_id_in_scope(&self.scope, event_id)
             .await
             .map_err(DatabaseError::backend)
     }
@@ -387,7 +420,7 @@ impl ScopedView<'_> {
     pub async fn query(&self, filter: NostrFilter) -> Result<Vec<NostrEvent>, DatabaseError> {
         self.db
             .db
-            .query_in_scope(self.scope.as_deref(), filter)
+            .query_in_scope(&self.scope, filter)
             .await
             .map_err(DatabaseError::backend)
     }
@@ -396,7 +429,7 @@ impl ScopedView<'_> {
     pub async fn delete(&self, filter: NostrFilter) -> Result<(), DatabaseError> {
         self.db
             .db
-            .delete_in_scope(self.scope.as_deref(), filter)
+            .delete_in_scope(&self.scope, filter)
             .await
             .map_err(DatabaseError::backend)
     }
@@ -405,7 +438,7 @@ impl ScopedView<'_> {
     pub async fn count(&self, filter: NostrFilter) -> Result<usize, DatabaseError> {
         self.db
             .db
-            .count_in_scope(self.scope.as_deref(), filter)
+            .count_in_scope(&self.scope, filter)
             .await
             .map_err(DatabaseError::backend)
     }
@@ -910,7 +943,7 @@ mod tests {
         let unscoped_view_res = db.scoped(None);
         assert!(unscoped_view_res.is_ok());
         let _unscoped_view = unscoped_view_res.unwrap();
-        assert!(_unscoped_view.scope.is_none());
+        assert!(_unscoped_view.scope.is_default());
 
         // Test creating a scoped view with an empty string inside Some()
         let empty_scope_res = db.scoped(Some(""));

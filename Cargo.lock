@@ -3919,13 +3919,14 @@ dependencies = [
 
 [[package]]
 name = "scoped-heed"
-version = "0.1.1"
+version = "0.2.0-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1baea88e882473dbdfbbfb8b9f7acd7e4eccbdae7a1c2c203ddd0687b69ddfb4"
+checksum = "b1549e3973a83a20a32557723bd03afb96b609a4a7fa22f1a9b4a214cdee841c"
 dependencies = [
  "bincode",
  "heed",
  "serde",
+ "twox-hash",
 ]
 
 [[package]]
@@ -5801,6 +5802,17 @@ dependencies = [
  "sha1",
  "thiserror 2.0.8",
  "utf-8",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "rand",
+ "static_assertions",
 ]
 
 [[package]]

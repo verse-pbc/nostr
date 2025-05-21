@@ -16,7 +16,7 @@ async-utility = { workspace = true }
 flatbuffers = "23.5.26"
 nostr = { workspace = true, features = ["std"] }
 nostr-database = { workspace = true, features = ["flatbuf"] }
-scoped-heed = "0.1.1"
+scoped-heed = "0.2.0-alpha.1"
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 

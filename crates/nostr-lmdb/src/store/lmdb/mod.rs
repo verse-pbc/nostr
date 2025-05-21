@@ -13,7 +13,8 @@ use nostr::event::borrow::EventBorrow;
 use nostr_database::flatbuffers::FlatBufferDecodeBorrowed;
 use nostr_database::prelude::*;
 use nostr_database::{nostr, FlatBufferBuilder, FlatBufferEncode, RejectedReason, SaveEventStatus};
-use scoped_heed::{scoped_database_options, ScopedBytesDatabase, ScopedDbError};
+use scoped_heed::{scoped_database_options, GlobalScopeRegistry, Scope, ScopedBytesDatabase, ScopedDbError};
+use std::sync::Arc;
 
 mod index;
 
@@ -35,14 +36,14 @@ type ScopedIterator<'txn> =
 
 pub struct ScopedView<'a> {
     db: &'a Lmdb,
-    scope: Option<String>,
+    scope: Scope,
 }
 
 #[allow(dead_code)]
 impl ScopedView<'_> {
     pub fn save_event(&self, event: &Event) -> Result<SaveEventStatus, Error> {
         let mut wtxn = self.db.env.write_txn()?;
-        let scope_opt = self.scope.as_deref();
+        let scope = &self.scope;
 
         if event.kind == Kind::EventDeletion {
             for tag in event.tags.iter() {
@@ -54,17 +55,17 @@ impl ScopedView<'_> {
                         } => {
                             let can_delete = self
                                 .db
-                                .get_event_by_id_in_txn(&wtxn, scope_opt, event_id_to_delete)?
+                                .get_event_by_id_in_txn(&wtxn, scope, event_id_to_delete)?
                                 .is_some_and(|borrow| borrow.pubkey == event.pubkey.as_bytes());
 
                             if can_delete {
                                 self.db.remove_event_in_scope(
                                     &mut wtxn,
-                                    scope_opt,
+                                    scope,
                                     event_id_to_delete,
                                 )?;
                                 self.db
-                                    .mark_deleted(&mut wtxn, scope_opt, event_id_to_delete)?;
+                                    .mark_deleted(&mut wtxn, scope, event_id_to_delete)?;
                             }
                         }
                         TagStandard::Coordinate {
@@ -76,7 +77,7 @@ impl ScopedView<'_> {
                                 let events_to_remove_borrows =
                                     self.db.find_events_by_coordinate_scoped(
                                         &wtxn, // RwTxn can be used as RoTxn here for finding
-                                        scope_opt,
+                                        scope,
                                         coord_to_delete,
                                         Timestamp::max(), // Find all versions up to now
                                     )?;
@@ -94,9 +95,9 @@ impl ScopedView<'_> {
                                 for id_val in event_ids_to_delete {
                                     // Remove the event and its indexes
                                     self.db
-                                        .remove_event_in_scope(&mut wtxn, scope_opt, &id_val)?;
+                                        .remove_event_in_scope(&mut wtxn, scope, &id_val)?;
                                     // Mark it as deleted (for NIP-09 tracking, if still desired)
-                                    self.db.mark_deleted(&mut wtxn, scope_opt, &id_val)?;
+                                    self.db.mark_deleted(&mut wtxn, scope, &id_val)?;
                                 }
 
                                 // The original mark_coordinate_deleted might be for a different purpose (e.g., NIP-09 receipt).
@@ -104,7 +105,7 @@ impl ScopedView<'_> {
                                 // If this is still needed for NIP-09 deletion event tracking, it can be kept:
                                 /* self.db.mark_coordinate_deleted(
                                     &mut wtxn,
-                                    scope_opt,
+                                    scope,
                                     &coord_to_delete.borrow(),
                                     event.created_at,
                                 )?; */
@@ -119,7 +120,7 @@ impl ScopedView<'_> {
             let existing_event_id_to_remove: Option<EventId> = if let Some(existing_event_borrow) =
                 self.db.find_replaceable_event_in_txn(
                     &wtxn,
-                    scope_opt,
+                    scope,
                     &event.pubkey,
                     event.kind,
                 )? {
@@ -136,7 +137,7 @@ impl ScopedView<'_> {
 
             if let Some(id_to_remove) = existing_event_id_to_remove {
                 self.db
-                    .remove_event_in_scope(&mut wtxn, scope_opt, &id_to_remove)?;
+                    .remove_event_in_scope(&mut wtxn, scope, &id_to_remove)?;
             }
         } else if event.kind.is_addressable() {
             if let Some(identifier) = event.tags.identifier() {
@@ -147,7 +148,7 @@ impl ScopedView<'_> {
                 let existing_event_id_to_remove: Option<EventId> =
                     if let Some(existing_event_borrow) =
                         self.db
-                            .find_addressable_event_in_txn(&wtxn, scope_opt, &coordinate)?
+                            .find_addressable_event_in_txn(&wtxn, scope, &coordinate)?
                     {
                         if event.created_at < existing_event_borrow.created_at
                             || (event.created_at == existing_event_borrow.created_at
@@ -162,7 +163,7 @@ impl ScopedView<'_> {
 
                 if let Some(id_to_remove) = existing_event_id_to_remove {
                     self.db
-                        .remove_event_in_scope(&mut wtxn, scope_opt, &id_to_remove)?;
+                        .remove_event_in_scope(&mut wtxn, scope, &id_to_remove)?;
                 }
             }
         }
@@ -173,13 +174,13 @@ impl ScopedView<'_> {
 
         self.db
             .events_sdb
-            .put(&mut wtxn, scope_opt, event_id_bytes, event_bytes)?;
+            .put(&mut wtxn, scope, event_id_bytes, event_bytes)?;
 
         let ci_key_bytes: Vec<u8> =
             index::make_ci_index_key(&event.created_at, event.id.as_bytes());
         self.db
             .ci_index_sdb
-            .put(&mut wtxn, scope_opt, &ci_key_bytes, event_id_bytes)?;
+            .put(&mut wtxn, scope, &ci_key_bytes, event_id_bytes)?;
 
         let akc_key_bytes: Vec<u8> = index::make_akc_index_key(
             event.pubkey.as_bytes(),
@@ -189,7 +190,7 @@ impl ScopedView<'_> {
         );
         self.db
             .akc_index_sdb
-            .put(&mut wtxn, scope_opt, &akc_key_bytes, event_id_bytes)?;
+            .put(&mut wtxn, scope, &akc_key_bytes, event_id_bytes)?;
 
         let ac_key_bytes: Vec<u8> = index::make_ac_index_key(
             event.pubkey.as_bytes(),
@@ -198,7 +199,7 @@ impl ScopedView<'_> {
         );
         self.db
             .ac_index_sdb
-            .put(&mut wtxn, scope_opt, &ac_key_bytes, event_id_bytes)?;
+            .put(&mut wtxn, scope, &ac_key_bytes, event_id_bytes)?;
 
         for tag in event.tags.iter() {
             if let Some(single_letter_tag) = tag.single_letter_tag() {
@@ -212,7 +213,7 @@ impl ScopedView<'_> {
                     );
                     self.db.atc_index_sdb.put(
                         &mut wtxn,
-                        scope_opt,
+                        scope,
                         &atc_key_bytes,
                         event_id_bytes,
                     )?;
@@ -226,7 +227,7 @@ impl ScopedView<'_> {
                     );
                     self.db.ktc_index_sdb.put(
                         &mut wtxn,
-                        scope_opt,
+                        scope,
                         &ktc_key_bytes,
                         event_id_bytes,
                     )?;
@@ -239,7 +240,7 @@ impl ScopedView<'_> {
                     );
                     self.db.tc_index_sdb.put(
                         &mut wtxn,
-                        scope_opt,
+                        scope,
                         &tc_key_bytes,
                         event_id_bytes,
                     )?;
@@ -253,10 +254,10 @@ impl ScopedView<'_> {
 
     pub fn event_by_id(&self, event_id: &EventId) -> Result<Option<Event>, Error> {
         let rtxn = self.db.read_txn()?;
-        let scope_opt = self.scope.as_deref();
+        let scope = &self.scope;
         let event_id_bytes = event_id.as_bytes();
 
-        match self.db.events_sdb.get(&rtxn, scope_opt, event_id_bytes)? {
+        match self.db.events_sdb.get(&rtxn, scope, event_id_bytes)? {
             Some(event_bytes) => {
                 let event = EventBorrow::decode(event_bytes)?.into_owned();
                 Ok(Some(event))
@@ -282,7 +283,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .ci_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -311,7 +312,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .tc_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -337,7 +338,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .ac_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -364,7 +365,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .akc_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -394,7 +395,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .atc_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -424,7 +425,7 @@ impl ScopedView<'_> {
         let underlying_iterator = self
             .db
             .ktc_index_sdb
-            .range(txn, self.scope.as_deref(), &range_bounds)
+            .range(txn, &self.scope, &range_bounds)
             .map_err(Error::from)?;
 
         let mapped_iterator = underlying_iterator;
@@ -435,7 +436,7 @@ impl ScopedView<'_> {
     fn iterate_filter_until_limit<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        _scope: Option<&str>,
+        _scope: &Scope,
         filter: &DatabaseFilter,
         iter: ScopedIterator<'txn>,
         _since: &mut Timestamp,
@@ -468,13 +469,13 @@ impl ScopedView<'_> {
             let event_data_bytes =
                 self.db
                     .events_sdb
-                    .get(txn, self.scope.as_deref(), &event_id_bytes)?;
+                    .get(txn, &self.scope, &event_id_bytes)?;
 
             if let Some(raw_event_bytes) = event_data_bytes {
                 // Check if the event has been deleted
                 let event_id = EventId::from_slice(&event_id_bytes)
                     .map_err(|_| Error::Other("Invalid event ID slice in iterate".to_string()))?;
-                if self.db.is_deleted(txn, self.scope.as_deref(), &event_id)? {
+                if self.db.is_deleted(txn, &self.scope, &event_id)? {
                     continue; // Skip deleted events
                 }
 
@@ -525,13 +526,13 @@ impl ScopedView<'_> {
             let event_data_bytes =
                 self.db
                     .events_sdb
-                    .get(txn, self.scope.as_deref(), &event_id_bytes)?;
+                    .get(txn, &self.scope, &event_id_bytes)?;
 
             if let Some(raw_event_bytes) = event_data_bytes {
                 // Check if the event has been deleted
                 let event_id = EventId::from_slice(&event_id_bytes)
                     .map_err(|_| Error::Other("Invalid event ID slice in count".to_string()))?;
-                if self.db.is_deleted(txn, self.scope.as_deref(), &event_id)? {
+                if self.db.is_deleted(txn, &self.scope, &event_id)? {
                     continue; // Skip deleted events
                 }
 
@@ -577,12 +578,12 @@ impl ScopedView<'_> {
                 if let Some(raw_event_bytes) =
                     self.db
                         .events_sdb
-                        .get(&txn, self.scope.as_deref(), id_bytes)?
+                        .get(&txn, &self.scope, id_bytes)?
                 {
                     // Check if the event has been deleted
                     let event_id = EventId::from_slice(id_bytes)
                         .map_err(|_| Error::Other("Invalid event ID slice".to_string()))?;
-                    if self.db.is_deleted(&txn, self.scope.as_deref(), &event_id)? {
+                    if self.db.is_deleted(&txn, &self.scope, &event_id)? {
                         continue; // Skip deleted events
                     }
 
@@ -609,7 +610,7 @@ impl ScopedView<'_> {
                     for kind_val in db_filter.kinds.iter() {
                         let iter = self.db.akc_iter_scoped(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             author,
                             *kind_val,
                             since_val,
@@ -617,7 +618,7 @@ impl ScopedView<'_> {
                         )?;
                         self.iterate_filter_until_limit(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             &db_filter,
                             iter,
                             &mut since_val,
@@ -641,7 +642,7 @@ impl ScopedView<'_> {
                         for tag_value in set.iter() {
                             let iter = self.db.atc_iter_scoped(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 author,
                                 tagname,
                                 tag_value,
@@ -650,7 +651,7 @@ impl ScopedView<'_> {
                             )?;
                             self.iterate_filter_until_limit(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 &db_filter,
                                 iter,
                                 &mut since_val,
@@ -680,7 +681,7 @@ impl ScopedView<'_> {
                         for tag_value in set.iter() {
                             let iter = self.db.ktc_iter_scoped(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 *kind_val,
                                 tag_name,
                                 tag_value,
@@ -689,7 +690,7 @@ impl ScopedView<'_> {
                             )?;
                             self.iterate_filter_until_limit(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 &db_filter,
                                 iter,
                                 &mut since_val,
@@ -718,7 +719,7 @@ impl ScopedView<'_> {
                     for tag_value in set.iter() {
                         let iter = self.db.tc_iter_scoped(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             tag_name,
                             tag_value,
                             &since_val,
@@ -726,7 +727,7 @@ impl ScopedView<'_> {
                         )?;
                         self.iterate_filter_until_limit(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             &db_filter,
                             iter,
                             &mut since_val,
@@ -748,14 +749,14 @@ impl ScopedView<'_> {
                 for author in db_filter.authors.iter() {
                     let iter = self.db.ac_iter_scoped(
                         &txn,
-                        self.scope.as_deref(),
+                        &self.scope,
                         author,
                         since_val,
                         query_until,
                     )?;
                     self.iterate_filter_until_limit(
                         &txn,
-                        self.scope.as_deref(),
+                        &self.scope,
                         &db_filter,
                         iter,
                         &mut since_val,
@@ -770,13 +771,13 @@ impl ScopedView<'_> {
             } else {
                 let iter = self.db.ci_iter_scoped(
                     &txn,
-                    self.scope.as_deref(),
+                    &self.scope,
                     &query_since,
                     &query_until,
                 )?;
                 self.iterate_filter_until_limit(
                     &txn,
-                    self.scope.as_deref(),
+                    &self.scope,
                     &db_filter,
                     iter,
                     &mut query_since,
@@ -826,7 +827,7 @@ impl ScopedView<'_> {
                 if let Some(raw_event_bytes) =
                     self.db
                         .events_sdb
-                        .get(&txn, self.scope.as_deref(), id_bytes)?
+                        .get(&txn, &self.scope, id_bytes)?
                 {
                     let event_borrow = EventBorrow::decode(raw_event_bytes)?;
                     if event_borrow.created_at >= query_since
@@ -849,7 +850,7 @@ impl ScopedView<'_> {
                     for kind_val in db_filter.kinds.iter() {
                         let iter = self.db.akc_iter_scoped(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             author,
                             *kind_val,
                             since_val,
@@ -879,7 +880,7 @@ impl ScopedView<'_> {
                         for tag_value in set.iter() {
                             let iter = self.db.atc_iter_scoped(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 author,
                                 tagname,
                                 tag_value,
@@ -915,7 +916,7 @@ impl ScopedView<'_> {
                         for tag_value in set.iter() {
                             let iter = self.db.ktc_iter_scoped(
                                 &txn,
-                                self.scope.as_deref(),
+                                &self.scope,
                                 *kind_val,
                                 tag_name,
                                 tag_value,
@@ -950,7 +951,7 @@ impl ScopedView<'_> {
                     for tag_value in set.iter() {
                         let iter = self.db.tc_iter_scoped(
                             &txn,
-                            self.scope.as_deref(),
+                            &self.scope,
                             tag_name,
                             tag_value,
                             &since_val,
@@ -979,7 +980,7 @@ impl ScopedView<'_> {
                 for author in db_filter.authors.iter() {
                     let iter = self.db.ac_iter_scoped(
                         &txn,
-                        self.scope.as_deref(),
+                        &self.scope,
                         author,
                         since_val,
                         query_until,
@@ -1000,7 +1001,7 @@ impl ScopedView<'_> {
             } else {
                 let iter = self.db.ci_iter_scoped(
                     &txn,
-                    self.scope.as_deref(),
+                    &self.scope,
                     &query_since,
                     &query_until,
                 )?;
@@ -1026,20 +1027,20 @@ impl ScopedView<'_> {
 
         task::spawn_blocking(move || {
             let mut wtxn = db_clone.env.write_txn()?;
-            let scope_opt_str = scope_clone.as_deref();
+            let scope_ref = &scope_clone;
 
             for event_val in events_to_delete {
                 let event_id_bytes = event_val.id.as_bytes();
 
                 db_clone
                     .events_sdb
-                    .delete(&mut wtxn, scope_opt_str, event_id_bytes)?;
+                    .delete(&mut wtxn, scope_ref, event_id_bytes)?;
 
                 let ci_key_bytes =
                     index::make_ci_index_key(&event_val.created_at, event_val.id.as_bytes());
                 db_clone
                     .ci_index_sdb
-                    .delete(&mut wtxn, scope_opt_str, &ci_key_bytes)?;
+                    .delete(&mut wtxn, scope_ref, &ci_key_bytes)?;
 
                 let akc_key_bytes = index::make_akc_index_key(
                     event_val.pubkey.as_bytes(),
@@ -1049,7 +1050,7 @@ impl ScopedView<'_> {
                 );
                 db_clone
                     .akc_index_sdb
-                    .delete(&mut wtxn, scope_opt_str, &akc_key_bytes)?;
+                    .delete(&mut wtxn, scope_ref, &akc_key_bytes)?;
 
                 let ac_key_bytes = index::make_ac_index_key(
                     event_val.pubkey.as_bytes(),
@@ -1058,7 +1059,7 @@ impl ScopedView<'_> {
                 );
                 db_clone
                     .ac_index_sdb
-                    .delete(&mut wtxn, scope_opt_str, &ac_key_bytes)?;
+                    .delete(&mut wtxn, scope_ref, &ac_key_bytes)?;
 
                 for tag in event_val.tags.iter() {
                     if let (Some(tag_name), Some(tag_value)) =
@@ -1073,7 +1074,7 @@ impl ScopedView<'_> {
                         );
                         db_clone
                             .atc_index_sdb
-                            .delete(&mut wtxn, scope_opt_str, &atc_index_key)?;
+                            .delete(&mut wtxn, scope_ref, &atc_index_key)?;
 
                         let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
                             event_val.kind.as_u16(),
@@ -1084,7 +1085,7 @@ impl ScopedView<'_> {
                         );
                         db_clone
                             .ktc_index_sdb
-                            .delete(&mut wtxn, scope_opt_str, &ktc_index_key)?;
+                            .delete(&mut wtxn, scope_ref, &ktc_index_key)?;
 
                         let tc_index_key: Vec<u8> = index::make_tc_index_key(
                             &tag_name,
@@ -1094,7 +1095,7 @@ impl ScopedView<'_> {
                         );
                         db_clone
                             .tc_index_sdb
-                            .delete(&mut wtxn, scope_opt_str, &tc_index_key)?;
+                            .delete(&mut wtxn, scope_ref, &tc_index_key)?;
                     }
                 }
             }
@@ -1120,6 +1121,37 @@ pub(crate) struct Lmdb {
 }
 
 impl Lmdb {
+    /// Convert Option<&str> to Scope for backward compatibility
+    #[inline]
+    pub(crate) fn to_scope(scope_opt: Option<&str>) -> Result<Scope, Error> {
+        match scope_opt {
+            Some(name) if !name.is_empty() => {
+                Scope::named(name).map_err(|e| Error::Other(format!("Invalid scope name: {}", e)))
+            }
+            Some(_) => Err(Error::EmptyScope),
+            None => Ok(Scope::Default),
+        }
+    }
+
+    pub(crate) fn create_registry(&self) -> Result<Option<Arc<GlobalScopeRegistry>>, Error> {
+        let mut wtxn = self.env.write_txn()?;
+        let registry = Arc::new(GlobalScopeRegistry::new(&self.env, &mut wtxn)?);
+        wtxn.commit()?;
+        Ok(Some(registry))
+    }
+    
+    pub(crate) fn register_scope(&self, registry: &Arc<GlobalScopeRegistry>, scope: &Scope) -> Result<(), Error> {
+        // Skip registration for default scope
+        if scope.is_default() {
+            return Ok(());
+        }
+        
+        let mut wtxn = self.env.write_txn()?;
+        registry.register_scope(&mut wtxn, scope)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+    
     pub(crate) fn new<P>(path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -1133,48 +1165,51 @@ impl Lmdb {
         };
 
         let mut txn = env.write_txn()?;
+        
+        // Create a global registry for all databases
+        let registry = Arc::new(GlobalScopeRegistry::new(&env, &mut txn)?);
 
-        let events_sdb = scoped_database_options(&env)
+        let events_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("events")
             .create(&mut txn)?;
 
-        let ci_index_sdb = scoped_database_options(&env)
+        let ci_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("ci_index")
             .create(&mut txn)?;
 
-        let tc_index_sdb = scoped_database_options(&env)
+        let tc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("tc_index")
             .create(&mut txn)?;
 
-        let ac_index_sdb = scoped_database_options(&env)
+        let ac_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("ac_index")
             .create(&mut txn)?;
 
-        let akc_index_sdb = scoped_database_options(&env)
+        let akc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("akc_index")
             .create(&mut txn)?;
 
-        let atc_index_sdb = scoped_database_options(&env)
+        let atc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("atc_index")
             .create(&mut txn)?;
 
-        let ktc_index_sdb = scoped_database_options(&env)
+        let ktc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("ktc_index")
             .create(&mut txn)?;
 
-        let deleted_ids_sdb = scoped_database_options(&env)
+        let deleted_ids_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("deleted_ids")
             .create(&mut txn)?;
 
-        let deleted_coordinates_sdb = scoped_database_options(&env)
+        let deleted_coordinates_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("deleted_coordinates")
             .create(&mut txn)?;
@@ -1208,7 +1243,7 @@ impl Lmdb {
     pub(crate) fn store_in_scope(
         &self,
         txn: &mut RwTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         fbb: &mut FlatBufferBuilder,
         event: &Event,
     ) -> Result<(), Error> {
@@ -1269,11 +1304,12 @@ impl Lmdb {
     }
 
     pub(crate) fn remove(&self, txn: &mut RwTxn, event_borrow: &EventBorrow) -> Result<(), Error> {
-        self.events_sdb.delete(txn, None, event_borrow.id)?;
+        let default_scope = &Scope::Default;
+        self.events_sdb.delete(txn, default_scope, event_borrow.id)?;
 
         let ci_index_key: Vec<u8> =
             index::make_ci_index_key(&event_borrow.created_at, event_borrow.id);
-        self.ci_index_sdb.delete(txn, None, &ci_index_key)?;
+        self.ci_index_sdb.delete(txn, default_scope, &ci_index_key)?;
 
         let akc_index_key: Vec<u8> = index::make_akc_index_key(
             event_borrow.pubkey,
@@ -1281,14 +1317,14 @@ impl Lmdb {
             &event_borrow.created_at,
             event_borrow.id,
         );
-        self.akc_index_sdb.delete(txn, None, &akc_index_key)?;
+        self.akc_index_sdb.delete(txn, default_scope, &akc_index_key)?;
 
         let ac_index_key: Vec<u8> = index::make_ac_index_key(
             event_borrow.pubkey,
             &event_borrow.created_at,
             event_borrow.id,
         );
-        self.ac_index_sdb.delete(txn, None, &ac_index_key)?;
+        self.ac_index_sdb.delete(txn, default_scope, &ac_index_key)?;
 
         for cow_tag in event_borrow.tags.iter() {
             if let Some((tag_name, tag_value)) = cow_tag.extract() {
@@ -1299,7 +1335,7 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.atc_index_sdb.delete(txn, None, &atc_index_key)?;
+                self.atc_index_sdb.delete(txn, default_scope, &atc_index_key)?;
 
                 let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
                     event_borrow.kind,
@@ -1308,7 +1344,7 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.ktc_index_sdb.delete(txn, None, &ktc_index_key)?;
+                self.ktc_index_sdb.delete(txn, default_scope, &ktc_index_key)?;
 
                 let tc_index_key: Vec<u8> = index::make_tc_index_key(
                     &tag_name,
@@ -1316,7 +1352,7 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.tc_index_sdb.delete(txn, None, &tc_index_key)?;
+                self.tc_index_sdb.delete(txn, default_scope, &tc_index_key)?;
             }
         }
 
@@ -1324,27 +1360,28 @@ impl Lmdb {
     }
 
     pub(crate) fn wipe(&self, txn: &mut RwTxn) -> Result<(), Error> {
-        self.events_sdb.clear(txn, None)?;
-        self.ci_index_sdb.clear(txn, None)?;
-        self.tc_index_sdb.clear(txn, None)?;
-        self.ac_index_sdb.clear(txn, None)?;
-        self.akc_index_sdb.clear(txn, None)?;
-        self.atc_index_sdb.clear(txn, None)?;
-        self.ktc_index_sdb.clear(txn, None)?;
-        self.deleted_ids_sdb.clear(txn, None)?;
-        self.deleted_coordinates_sdb.clear(txn, None)?;
+        let default_scope = &Scope::Default;
+        self.events_sdb.clear(txn, default_scope)?;
+        self.ci_index_sdb.clear(txn, default_scope)?;
+        self.tc_index_sdb.clear(txn, default_scope)?;
+        self.ac_index_sdb.clear(txn, default_scope)?;
+        self.akc_index_sdb.clear(txn, default_scope)?;
+        self.atc_index_sdb.clear(txn, default_scope)?;
+        self.ktc_index_sdb.clear(txn, default_scope)?;
+        self.deleted_ids_sdb.clear(txn, default_scope)?;
+        self.deleted_coordinates_sdb.clear(txn, default_scope)?;
         Ok(())
     }
 
     #[inline]
     pub(crate) fn has_event(&self, txn: &RoTxn, event_id: &[u8; 32]) -> Result<bool, Error> {
-        self.has_event_in_scope(txn, None, event_id)
+        self.has_event_in_scope(txn, &Scope::Default, event_id)
     }
 
     pub(crate) fn has_event_in_scope(
         &self,
         txn: &RoTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: &[u8; 32],
     ) -> Result<bool, Error> {
         Ok(self
@@ -1356,7 +1393,7 @@ impl Lmdb {
     pub(crate) fn get_event_by_id_in_txn<'txn>(
         &self,
         txn: &'txn RoTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: &EventId,
     ) -> Result<Option<EventBorrow<'txn>>, Error> {
         match self.events_sdb.get(txn, scope, event_id.as_bytes())? {
@@ -1366,7 +1403,7 @@ impl Lmdb {
     }
 
     pub fn delete(&self, read_txn: &RoTxn, txn: &mut RwTxn, filter: Filter) -> Result<(), Error> {
-        let events_iter = self.query(read_txn, None, filter)?;
+        let events_iter = self.query(read_txn, &Scope::Default, filter)?;
         for event_result in events_iter {
             let event_borrow = event_result?;
             self.remove(txn, &event_borrow)?;
@@ -1377,7 +1414,7 @@ impl Lmdb {
     pub fn query<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         filter: Filter,
     ) -> Result<Box<dyn Iterator<Item = Result<EventBorrow<'txn>, Error>> + 'txn>, Error> {
         if let (Some(since), Some(until)) = (filter.since, filter.until) {
@@ -1632,7 +1669,7 @@ impl Lmdb {
     pub fn find_replaceable_event_in_txn<'txn>(
         &self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         author: &PublicKey,
         kind: Kind,
     ) -> Result<Option<EventBorrow<'txn>>, Error> {
@@ -1661,7 +1698,7 @@ impl Lmdb {
     pub fn find_addressable_event_in_txn<'txn>(
         &self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         coordinate: &Coordinate,
     ) -> Result<Option<EventBorrow<'txn>>, Error> {
         if !coordinate.kind.is_addressable() {
@@ -1692,7 +1729,7 @@ impl Lmdb {
     pub(crate) fn is_deleted(
         &self,
         txn: &RoTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: &EventId,
     ) -> Result<bool, Error> {
         Ok(self
@@ -1704,7 +1741,7 @@ impl Lmdb {
     pub(crate) fn mark_deleted(
         &self,
         txn: &mut RwTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: &EventId,
     ) -> Result<(), Error> {
         self.deleted_ids_sdb
@@ -1715,7 +1752,7 @@ impl Lmdb {
     pub(crate) fn mark_coordinate_deleted(
         &self,
         txn: &mut RwTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         coordinate: &CoordinateBorrow,
         when: Timestamp,
     ) -> Result<(), Error> {
@@ -1728,7 +1765,7 @@ impl Lmdb {
     pub(crate) fn when_is_coordinate_deleted<'txn>(
         &self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         coordinate: &CoordinateBorrow<'txn>,
     ) -> Result<Option<Timestamp>, Error> {
         let key: Vec<u8> = index::make_coordinate_index_key(coordinate);
@@ -1741,7 +1778,7 @@ impl Lmdb {
     pub(crate) fn ci_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         since: &Timestamp,
         until: &Timestamp,
     ) -> Result<ScopedIterator<'txn>, Error> {
@@ -1761,7 +1798,7 @@ impl Lmdb {
     pub(crate) fn tc_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         tag_name: &SingleLetterTag,
         tag_value: &str,
         since: &Timestamp,
@@ -1784,7 +1821,7 @@ impl Lmdb {
     pub(crate) fn ac_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         author: &[u8; 32],
         since: Timestamp,
         until: Timestamp,
@@ -1804,7 +1841,7 @@ impl Lmdb {
     pub(crate) fn akc_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         author: &[u8; 32],
         kind: u16,
         since: Timestamp,
@@ -1831,7 +1868,7 @@ impl Lmdb {
     pub(crate) fn atc_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         author: &[u8; 32],
         tag_name: &SingleLetterTag,
         tag_value: &str,
@@ -1861,7 +1898,7 @@ impl Lmdb {
     pub(crate) fn ktc_iter_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         kind: u16,
         tag_name: &SingleLetterTag,
         tag_value: &str,
@@ -1891,7 +1928,7 @@ impl Lmdb {
     pub(crate) fn find_events_by_coordinate_scoped<'txn>(
         &'txn self,
         txn: &'txn RoTxn<'txn>,
-        scope: Option<&str>,
+        scope: &Scope,
         coordinate: &Coordinate,
         before_or_at: Timestamp,
     ) -> Result<Vec<EventBorrow<'txn>>, Error> {
@@ -1943,23 +1980,29 @@ impl Lmdb {
     }
 
     pub(crate) fn scoped(&self, scope_name: &str) -> ScopedView<'_> {
+        let scope = Scope::named(scope_name).unwrap_or_else(|_| {
+            // This should never happen since we validate scope_name earlier
+            tracing::warn!("Invalid scope name '{}', falling back to default scope", scope_name);
+            Scope::Default
+        });
+        
         ScopedView {
             db: self,
-            scope: Some(scope_name.to_string()),
+            scope,
         }
     }
 
     pub(crate) fn unscoped(&self) -> ScopedView<'_> {
         ScopedView {
             db: self,
-            scope: None,
+            scope: Scope::Default,
         }
     }
 
     pub(crate) fn remove_event_in_scope(
         &self,
         txn: &mut RwTxn,
-        scope: Option<&str>,
+        scope: &Scope,
         event_id: &EventId,
     ) -> Result<bool, Error> {
         let (id_copy, created_at_copy, pubkey_copy, kind_copy, sl_tags_copy) = {
