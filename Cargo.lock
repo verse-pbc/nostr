@@ -3919,9 +3919,9 @@ dependencies = [
 
 [[package]]
 name = "scoped-heed"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1549e3973a83a20a32557723bd03afb96b609a4a7fa22f1a9b4a214cdee841c"
+checksum = "4f3bfb91b5679beb6e680c1db1bf0e1e36908ecb558973ca287b767b4d534cb6"
 dependencies = [
  "bincode",
  "heed",
