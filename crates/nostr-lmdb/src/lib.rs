@@ -27,6 +27,7 @@
 //! ```no_run
 //! use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
 //! use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//! use scoped_heed::Scope;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! # let keys = Keys::generate();
@@ -34,7 +35,8 @@
 //! let db = NostrLMDB::open("./db")?;
 //!
 //! // Save an event in the "tenant_a" scope
-//! let tenant_a = db.scoped(Some("tenant_a"))?;
+//! let scope = Scope::named("tenant_a")?;
+//! let tenant_a = db.scoped(&scope)?;
 //! tenant_a.save_event(&event).await?;
 //!
 //! // Query events in the "tenant_a" scope
@@ -55,17 +57,20 @@
 //! ```no_run
 //! # use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
 //! # use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//! # use scoped_heed::Scope;
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! # let db = NostrLMDB::open("./db")?;
 //! # let keys = Keys::generate();
 //! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
 //! let filter = Filter::new();
 //! // These operations are completely isolated
-//! db.scoped(Some("tenant_a"))?.save_event(&event).await?;
-//! db.scoped(Some("tenant_b"))?.save_event(&event).await?;
+//! let scope_a = Scope::named("tenant_a")?;
+//! let scope_b = Scope::named("tenant_b")?;
+//! db.scoped(&scope_a)?.save_event(&event).await?;
+//! db.scoped(&scope_b)?.save_event(&event).await?;
 //!
-//! let tenant_a_events = db.scoped(Some("tenant_a"))?.query(filter.clone()).await?;
-//! let tenant_b_events = db.scoped(Some("tenant_b"))?.query(filter.clone()).await?;
+//! let tenant_a_events = db.scoped(&scope_a)?.query(filter.clone()).await?;
+//! let tenant_b_events = db.scoped(&scope_b)?.query(filter.clone()).await?;
 //! let global_events = db.query(filter).await?; // Direct call for unscoped
 //!
 //! // Each query only sees events in its own scope
@@ -123,6 +128,7 @@ pub use nostr_database::{
 pub use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod store;
+
 
 use self::store::Store;
 
@@ -338,43 +344,24 @@ impl NostrEventsDatabase for ScopedView<'_> {
 }
 
 impl NostrLMDB {
-    /// Create a scoped view for database operations
+    /// Create a scoped view for database operations using a Scope object
     ///
-    /// - If `scope_name` is `Some(name)`:
-    ///   - If `name` is not empty, a view for the named scope `name` is created.
-    ///   - If `name` is empty, an error is returned.
-    /// - If `scope_name` is `None`, a view for unscoped (global) operations is created.
-    pub fn scoped(&self, scope_name: Option<&str>) -> Result<ScopedView<'_>, DatabaseError> {
-        let scope = match scope_name {
-            Some(name) if !name.is_empty() => {
-                // Create a named scope
-                let scope = Scope::named(name).map_err(|e| {
-                    DatabaseError::Backend(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Failed to create scope: {}", e),
-                    )))
-                })?;
-                
-                // Register the scope in the registry if available
-                if let Some(registry) = &self.registry {
-                    // We need to get a write transaction from the database
-                    self.db.register_scope(registry, &scope).map_err(DatabaseError::backend)?;
-                }
-                
-                scope
+    /// - Pass a `Scope::Named` struct with a non-empty name for named scope
+    /// - Pass `Scope::Default` for unscoped (global) operations
+    ///
+    /// This method requires using the Scope enum directly.
+    pub fn scoped(&self, scope: &Scope) -> Result<ScopedView<'_>, DatabaseError> {
+        // Register the scope in the registry if available and it's a named scope
+        if let Scope::Named { .. } = scope {
+            if let Some(registry) = &self.registry {
+                // Register the scope in the registry - this is critical for proper scope management
+                self.db.register_scope(registry, scope).map_err(DatabaseError::backend)?;
             }
-            Some(_) => {
-                return Err(DatabaseError::Backend(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Scope name cannot be empty if Some(scope_name) is provided.",
-                ))));
-            }
-            None => Scope::Default,
-        };
+        }
         
         let view = ScopedView {
             db: self,
-            scope,
+            scope: scope.clone(),
         };
         Ok(view)
     }
@@ -384,6 +371,15 @@ impl NostrLMDB {
         ScopedView {
             db: self,
             scope: Scope::Default,
+        }
+    }
+    
+    /// List all registered scopes in the database
+    pub fn list_scopes(&self) -> Result<Vec<Scope>, DatabaseError> {
+        // Pass the singleton registry to the get_registry_scopes method
+        match self.db.get_registry_scopes(self.registry.as_ref()).map_err(DatabaseError::backend)? {
+            Some(scopes) => Ok(scopes),
+            None => Ok(vec![Scope::Default]),
         }
     }
 }
@@ -456,10 +452,10 @@ mod tests {
     };
     use crate::{
         Coordinate, // Now available as crate::Coordinate
-        DatabaseError,
         NostrEventsDatabase,
         NostrLMDB,
         SaveEventStatus,
+        Scope,
     };
 
     const EVENTS: [&str; 14] = [
@@ -794,9 +790,12 @@ mod tests {
 
         let scope1_name = "scope1";
         let scope2_name = "scope2";
+        
+        let scope1 = Scope::named(scope1_name).unwrap();
+        let scope2 = Scope::named(scope2_name).unwrap();
 
-        let view_s1 = db.scoped(Some(scope1_name)).unwrap();
-        let view_s2 = db.scoped(Some(scope2_name)).unwrap();
+        let view_s1 = db.scoped(&scope1).unwrap();
+        let view_s2 = db.scoped(&scope2).unwrap();
 
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();
@@ -935,28 +934,20 @@ mod tests {
         let db = TempDatabase::new();
 
         // Test successful creation of a named scoped view
-        let scoped_view_res = db.scoped(Some("test_scope"));
+        let test_scope = Scope::named("test_scope").unwrap();
+        let scoped_view_res = db.scoped(&test_scope);
         assert!(scoped_view_res.is_ok());
         let _scoped_view = scoped_view_res.unwrap();
 
         // Test successful creation of an unscoped view
-        let unscoped_view_res = db.scoped(None);
+        let unscoped_view_res = db.scoped(&Scope::Default);
         assert!(unscoped_view_res.is_ok());
         let _unscoped_view = unscoped_view_res.unwrap();
         assert!(_unscoped_view.scope.is_default());
-
-        // Test creating a scoped view with an empty string inside Some()
-        let empty_scope_res = db.scoped(Some(""));
-        assert!(empty_scope_res.is_err());
-        match empty_scope_res.err().unwrap() {
-            DatabaseError::Backend(e) => {
-                // Compare the error message string
-                assert_eq!(
-                    e.to_string(),
-                    "Scope name cannot be empty if Some(scope_name) is provided."
-                );
-            }
-            _ => panic!("Expected DatabaseError::Backend for empty scope name in Some()"),
-        }
+        
+        // Test creating an invalid scope directly
+        // This won't compile because Scope::named validates at compile time
+        // but we can test database operations with an empty string
+        // let empty_scope = Scope::named("").unwrap(); // This would panic
     }
 }

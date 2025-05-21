@@ -22,7 +22,8 @@ use nostr_lmdb::nostr::{
     Tag,
     Timestamp,
 };
-use nostr_lmdb::{DatabaseError, NostrEventsDatabase, NostrLMDB, SaveEventStatus};
+use scoped_heed::Scope;
+use nostr_lmdb::{NostrEventsDatabase, NostrLMDB, SaveEventStatus};
 use tempfile::TempDir;
 
 // Helper struct for managing a temporary database instance for tests
@@ -51,8 +52,9 @@ impl TempDatabase {
     // Helper to save an event, abstracting away direct ScopedView usage for cleaner tests
     async fn save_event_in_view(&self, scope_name: Option<&str>, event: &Event) -> SaveEventStatus {
         if let Some(name) = scope_name {
+            let scope = Scope::named(name).expect("Failed to create named scope");
             self.db
-                .scoped(Some(name))
+                .scoped(&scope)
                 .expect("Failed to create scoped view")
                 .save_event(event)
                 .await
@@ -68,8 +70,9 @@ impl TempDatabase {
 
     async fn query_from_view(&self, scope_name: Option<&str>, filter: Filter) -> Vec<Event> {
         if let Some(name) = scope_name {
+            let scope = Scope::named(name).expect("Failed to create named scope");
             self.db
-                .scoped(Some(name))
+                .scoped(&scope)
                 .expect("Failed to create scoped view")
                 .query(filter)
                 .await
@@ -91,8 +94,9 @@ impl TempDatabase {
         event_id: &nostr_lmdb::nostr::EventId,
     ) -> Option<Event> {
         if let Some(name) = scope_name {
+            let scope = Scope::named(name).expect("Failed to create named scope");
             self.db
-                .scoped(Some(name))
+                .scoped(&scope)
                 .expect("Failed to create scoped view")
                 .event_by_id(*event_id)
                 .await
@@ -108,8 +112,9 @@ impl TempDatabase {
 
     async fn delete_from_view(&self, scope_name: Option<&str>, filter: Filter) {
         if let Some(name) = scope_name {
+            let scope = Scope::named(name).expect("Failed to create named scope");
             self.db
-                .scoped(Some(name))
+                .scoped(&scope)
                 .expect("Failed to create scoped view")
                 .delete(filter)
                 .await
@@ -125,8 +130,9 @@ impl TempDatabase {
 
     async fn count_from_view(&self, scope_name: Option<&str>, filter: Filter) -> usize {
         if let Some(name) = scope_name {
+            let scope = Scope::named(name).expect("Failed to create named scope");
             self.db
-                .scoped(Some(name))
+                .scoped(&scope)
                 .expect("Failed to create scoped view")
                 .count(filter)
                 .await
@@ -319,29 +325,22 @@ async fn test_scoped_count() {
 #[tokio::test]
 async fn test_scoped_error_empty_scope_name() {
     let db = TempDatabase::new();
-    // Test with Some("")
-    let result = db.db.scoped(Some(""));
-    assert!(result.is_err(), "Expected error for empty scope name");
-    if let Err(DatabaseError::Backend(b)) = result {
-        assert_eq!(
-            b.to_string(),
-            "Scope name cannot be empty if Some(scope_name) is provided."
-        );
-    } else {
-        panic!("Unexpected error type for empty scope name: {:?}", result);
-    }
-
-    // Test with None (should be Ok for an unscoped view)
-    let result_unscoped = db.db.scoped(None);
+    
+    // Test with empty string in Scope::named
+    let empty_scope_result = Scope::named("");
+    assert!(empty_scope_result.is_err(), "Expected error for empty scope name");
+    
+    // Test with Scope::Default (should be Ok for an unscoped view)
+    let result_unscoped = db.db.scoped(&Scope::Default);
     assert!(
         result_unscoped.is_ok(),
-        "Expected Ok for None scope, got {:?}",
+        "Expected Ok for Scope::Default, got {:?}",
         result_unscoped
     );
     let unscoped_view = result_unscoped.unwrap();
     assert!(
         unscoped_view.scope_name().is_none(),
-        "Expected unscoped view to have None scope name"
+        "Expected unscoped view to have default (None) scope name"
     );
 }
 
@@ -735,4 +734,47 @@ async fn test_complex_deletion_debug() {
         !events_vec.iter().any(|e| e.id == event.id),
         "Original event should be deleted"
     );
+}
+
+#[tokio::test]
+async fn test_list_scopes() {
+    let db = TempDatabase::new();
+    let keys = Keys::generate();
+
+    // Create test events
+    let event_scope1 = create_test_text_note("event in scope1", &keys);
+    let event_scope2 = create_test_text_note("event in scope2", &keys);
+    let event_scope3 = create_test_text_note("event in scope3", &keys);
+    let event_unscoped = create_test_text_note("event in default scope", &keys);
+
+    // Save events in different scopes
+    db.save_event_in_view(Some("scope1"), &event_scope1).await;
+    db.save_event_in_view(Some("scope2"), &event_scope2).await;
+    db.save_event_in_view(Some("scope3"), &event_scope3).await;
+    db.save_event_in_view(None, &event_unscoped).await;
+
+    // Verify each scope has the correct events
+    assert_eq!(db.query_from_view(Some("scope1"), Filter::new()).await.len(), 1);
+    assert_eq!(db.query_from_view(Some("scope2"), Filter::new()).await.len(), 1);
+    assert_eq!(db.query_from_view(Some("scope3"), Filter::new()).await.len(), 1);
+    assert_eq!(db.query_from_view(None, Filter::new()).await.len(), 1);
+
+    // Get list of scopes and verify
+    let scopes = db.list_scopes().expect("Failed to list scopes");
+    
+    // Convert scope names to a set for easier comparison
+    let scope_names: Vec<Option<&str>> = scopes.iter().map(|s| s.name()).collect();
+    
+    // Verify all expected scopes are present
+    assert!(scope_names.contains(&Some("scope1")), "scope1 should be in the list");
+    assert!(scope_names.contains(&Some("scope2")), "scope2 should be in the list");
+    assert!(scope_names.contains(&Some("scope3")), "scope3 should be in the list");
+    assert!(scope_names.contains(&None), "Default scope should be in the list");
+    
+    // Verify the total count is correct (should be 4: 3 named scopes + default scope)
+    assert_eq!(scopes.len(), 4, "Should have exactly 4 scopes");
+    
+    // Verify there's exactly one Default scope
+    let default_scope_count = scopes.iter().filter(|s| s.is_default()).count();
+    assert_eq!(default_scope_count, 1, "Should have exactly one Default scope");
 }

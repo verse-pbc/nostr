@@ -1152,6 +1152,17 @@ impl Lmdb {
         Ok(())
     }
     
+    pub(crate) fn get_registry_scopes(&self, registry: Option<&Arc<GlobalScopeRegistry>>) -> Result<Option<Vec<Scope>>, Error> {
+        if let Some(reg) = registry {
+            let txn = self.env.read_txn()?;
+            let scopes = reg.list_all_scopes(&txn)?;
+            txn.commit()?;
+            Ok(Some(scopes))
+        } else {
+            Ok(None)
+        }
+    }
+    
     pub(crate) fn new<P>(path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,

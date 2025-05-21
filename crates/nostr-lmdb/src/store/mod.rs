@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use async_utility::task;
 use nostr_database::prelude::*;
@@ -50,6 +51,18 @@ impl Store {
     /// Register a scope in the registry
     pub fn register_scope(&self, registry: &std::sync::Arc<GlobalScopeRegistry>, scope: &scoped_heed::Scope) -> Result<(), Error> {
         self.db.register_scope(registry, scope)
+    }
+    
+    /// Get all scopes from the registry
+    pub fn get_registry_scopes(&self, registry: Option<&Arc<GlobalScopeRegistry>>) -> Result<Option<Vec<scoped_heed::Scope>>, Error> {
+        if let Some(reg) = registry {
+            // Use the provided registry
+            self.db.get_registry_scopes(Some(reg))
+        } else {
+            // Create a new registry if none provided (backward compatibility)
+            let new_registry = self.db.create_registry()?;
+            self.db.get_registry_scopes(new_registry.as_ref())
+        }
     }
 
     #[inline]
