@@ -1162,6 +1162,7 @@ impl Lmdb {
         let events_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("events")
+            .unnamed_for_default()
             .create(&mut txn)?;
 
         let ci_index_sdb = scoped_database_options(&env, registry.clone())
