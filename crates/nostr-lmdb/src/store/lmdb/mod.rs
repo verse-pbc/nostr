@@ -13,7 +13,9 @@ use nostr::event::borrow::EventBorrow;
 use nostr_database::flatbuffers::FlatBufferDecodeBorrowed;
 use nostr_database::prelude::*;
 use nostr_database::{nostr, FlatBufferBuilder, FlatBufferEncode, RejectedReason, SaveEventStatus};
-use scoped_heed::{scoped_database_options, GlobalScopeRegistry, Scope, ScopedBytesDatabase, ScopedDbError};
+use scoped_heed::{
+    scoped_database_options, GlobalScopeRegistry, Scope, ScopedBytesDatabase, ScopedDbError,
+};
 use std::sync::Arc;
 
 mod index;
@@ -64,8 +66,7 @@ impl ScopedView<'_> {
                                     scope,
                                     event_id_to_delete,
                                 )?;
-                                self.db
-                                    .mark_deleted(&mut wtxn, scope, event_id_to_delete)?;
+                                self.db.mark_deleted(&mut wtxn, scope, event_id_to_delete)?;
                             }
                         }
                         TagStandard::Coordinate {
@@ -94,8 +95,7 @@ impl ScopedView<'_> {
 
                                 for id_val in event_ids_to_delete {
                                     // Remove the event and its indexes
-                                    self.db
-                                        .remove_event_in_scope(&mut wtxn, scope, &id_val)?;
+                                    self.db.remove_event_in_scope(&mut wtxn, scope, &id_val)?;
                                     // Mark it as deleted (for NIP-09 tracking, if still desired)
                                     self.db.mark_deleted(&mut wtxn, scope, &id_val)?;
                                 }
@@ -118,12 +118,9 @@ impl ScopedView<'_> {
         } else if event.kind.is_replaceable() {
             let event_id_owned = event.id;
             let existing_event_id_to_remove: Option<EventId> = if let Some(existing_event_borrow) =
-                self.db.find_replaceable_event_in_txn(
-                    &wtxn,
-                    scope,
-                    &event.pubkey,
-                    event.kind,
-                )? {
+                self.db
+                    .find_replaceable_event_in_txn(&wtxn, scope, &event.pubkey, event.kind)?
+            {
                 if event.created_at < existing_event_borrow.created_at
                     || (event.created_at == existing_event_borrow.created_at
                         && event_id_owned.as_bytes() < existing_event_borrow.id)
@@ -211,12 +208,9 @@ impl ScopedView<'_> {
                         &event.created_at,
                         event.id.as_bytes(),
                     );
-                    self.db.atc_index_sdb.put(
-                        &mut wtxn,
-                        scope,
-                        &atc_key_bytes,
-                        event_id_bytes,
-                    )?;
+                    self.db
+                        .atc_index_sdb
+                        .put(&mut wtxn, scope, &atc_key_bytes, event_id_bytes)?;
 
                     let ktc_key_bytes: Vec<u8> = index::make_ktc_index_key(
                         event.kind.as_u16(),
@@ -225,12 +219,9 @@ impl ScopedView<'_> {
                         &event.created_at,
                         event.id.as_bytes(),
                     );
-                    self.db.ktc_index_sdb.put(
-                        &mut wtxn,
-                        scope,
-                        &ktc_key_bytes,
-                        event_id_bytes,
-                    )?;
+                    self.db
+                        .ktc_index_sdb
+                        .put(&mut wtxn, scope, &ktc_key_bytes, event_id_bytes)?;
 
                     let tc_key_bytes: Vec<u8> = index::make_tc_index_key(
                         &single_letter_tag,
@@ -238,12 +229,9 @@ impl ScopedView<'_> {
                         &event.created_at,
                         event.id.as_bytes(),
                     );
-                    self.db.tc_index_sdb.put(
-                        &mut wtxn,
-                        scope,
-                        &tc_key_bytes,
-                        event_id_bytes,
-                    )?;
+                    self.db
+                        .tc_index_sdb
+                        .put(&mut wtxn, scope, &tc_key_bytes, event_id_bytes)?;
                 }
             }
         }
@@ -466,10 +454,7 @@ impl ScopedView<'_> {
                 continue;
             }
 
-            let event_data_bytes =
-                self.db
-                    .events_sdb
-                    .get(txn, &self.scope, &event_id_bytes)?;
+            let event_data_bytes = self.db.events_sdb.get(txn, &self.scope, &event_id_bytes)?;
 
             if let Some(raw_event_bytes) = event_data_bytes {
                 // Check if the event has been deleted
@@ -523,10 +508,7 @@ impl ScopedView<'_> {
                 continue;
             }
 
-            let event_data_bytes =
-                self.db
-                    .events_sdb
-                    .get(txn, &self.scope, &event_id_bytes)?;
+            let event_data_bytes = self.db.events_sdb.get(txn, &self.scope, &event_id_bytes)?;
 
             if let Some(raw_event_bytes) = event_data_bytes {
                 // Check if the event has been deleted
@@ -576,9 +558,7 @@ impl ScopedView<'_> {
                     continue;
                 }
                 if let Some(raw_event_bytes) =
-                    self.db
-                        .events_sdb
-                        .get(&txn, &self.scope, id_bytes)?
+                    self.db.events_sdb.get(&txn, &self.scope, id_bytes)?
                 {
                     // Check if the event has been deleted
                     let event_id = EventId::from_slice(id_bytes)
@@ -769,12 +749,9 @@ impl ScopedView<'_> {
                     }
                 }
             } else {
-                let iter = self.db.ci_iter_scoped(
-                    &txn,
-                    &self.scope,
-                    &query_since,
-                    &query_until,
-                )?;
+                let iter = self
+                    .db
+                    .ci_iter_scoped(&txn, &self.scope, &query_since, &query_until)?;
                 self.iterate_filter_until_limit(
                     &txn,
                     &self.scope,
@@ -825,9 +802,7 @@ impl ScopedView<'_> {
                     continue;
                 }
                 if let Some(raw_event_bytes) =
-                    self.db
-                        .events_sdb
-                        .get(&txn, &self.scope, id_bytes)?
+                    self.db.events_sdb.get(&txn, &self.scope, id_bytes)?
                 {
                     let event_borrow = EventBorrow::decode(raw_event_bytes)?;
                     if event_borrow.created_at >= query_since
@@ -999,12 +974,9 @@ impl ScopedView<'_> {
                     }
                 }
             } else {
-                let iter = self.db.ci_iter_scoped(
-                    &txn,
-                    &self.scope,
-                    &query_since,
-                    &query_until,
-                )?;
+                let iter = self
+                    .db
+                    .ci_iter_scoped(&txn, &self.scope, &query_since, &query_until)?;
                 self.iterate_filter_and_count(
                     &txn,
                     &db_filter,
@@ -1139,20 +1111,27 @@ impl Lmdb {
         wtxn.commit()?;
         Ok(Some(registry))
     }
-    
-    pub(crate) fn register_scope(&self, registry: &Arc<GlobalScopeRegistry>, scope: &Scope) -> Result<(), Error> {
+
+    pub(crate) fn register_scope(
+        &self,
+        registry: &Arc<GlobalScopeRegistry>,
+        scope: &Scope,
+    ) -> Result<(), Error> {
         // Skip registration for default scope
         if scope.is_default() {
             return Ok(());
         }
-        
+
         let mut wtxn = self.env.write_txn()?;
         registry.register_scope(&mut wtxn, scope)?;
         wtxn.commit()?;
         Ok(())
     }
-    
-    pub(crate) fn get_registry_scopes(&self, registry: Option<&Arc<GlobalScopeRegistry>>) -> Result<Option<Vec<Scope>>, Error> {
+
+    pub(crate) fn get_registry_scopes(
+        &self,
+        registry: Option<&Arc<GlobalScopeRegistry>>,
+    ) -> Result<Option<Vec<Scope>>, Error> {
         if let Some(reg) = registry {
             let txn = self.env.read_txn()?;
             let scopes = reg.list_all_scopes(&txn)?;
@@ -1162,7 +1141,7 @@ impl Lmdb {
             Ok(None)
         }
     }
-    
+
     pub(crate) fn new<P>(path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -1176,7 +1155,7 @@ impl Lmdb {
         };
 
         let mut txn = env.write_txn()?;
-        
+
         // Create a global registry for all databases
         let registry = Arc::new(GlobalScopeRegistry::new(&env, &mut txn)?);
 
@@ -1316,11 +1295,13 @@ impl Lmdb {
 
     pub(crate) fn remove(&self, txn: &mut RwTxn, event_borrow: &EventBorrow) -> Result<(), Error> {
         let default_scope = &Scope::Default;
-        self.events_sdb.delete(txn, default_scope, event_borrow.id)?;
+        self.events_sdb
+            .delete(txn, default_scope, event_borrow.id)?;
 
         let ci_index_key: Vec<u8> =
             index::make_ci_index_key(&event_borrow.created_at, event_borrow.id);
-        self.ci_index_sdb.delete(txn, default_scope, &ci_index_key)?;
+        self.ci_index_sdb
+            .delete(txn, default_scope, &ci_index_key)?;
 
         let akc_index_key: Vec<u8> = index::make_akc_index_key(
             event_borrow.pubkey,
@@ -1328,14 +1309,16 @@ impl Lmdb {
             &event_borrow.created_at,
             event_borrow.id,
         );
-        self.akc_index_sdb.delete(txn, default_scope, &akc_index_key)?;
+        self.akc_index_sdb
+            .delete(txn, default_scope, &akc_index_key)?;
 
         let ac_index_key: Vec<u8> = index::make_ac_index_key(
             event_borrow.pubkey,
             &event_borrow.created_at,
             event_borrow.id,
         );
-        self.ac_index_sdb.delete(txn, default_scope, &ac_index_key)?;
+        self.ac_index_sdb
+            .delete(txn, default_scope, &ac_index_key)?;
 
         for cow_tag in event_borrow.tags.iter() {
             if let Some((tag_name, tag_value)) = cow_tag.extract() {
@@ -1346,7 +1329,8 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.atc_index_sdb.delete(txn, default_scope, &atc_index_key)?;
+                self.atc_index_sdb
+                    .delete(txn, default_scope, &atc_index_key)?;
 
                 let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
                     event_borrow.kind,
@@ -1355,7 +1339,8 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.ktc_index_sdb.delete(txn, default_scope, &ktc_index_key)?;
+                self.ktc_index_sdb
+                    .delete(txn, default_scope, &ktc_index_key)?;
 
                 let tc_index_key: Vec<u8> = index::make_tc_index_key(
                     &tag_name,
@@ -1363,7 +1348,8 @@ impl Lmdb {
                     &event_borrow.created_at,
                     event_borrow.id,
                 );
-                self.tc_index_sdb.delete(txn, default_scope, &tc_index_key)?;
+                self.tc_index_sdb
+                    .delete(txn, default_scope, &tc_index_key)?;
             }
         }
 
@@ -1687,7 +1673,7 @@ impl Lmdb {
         if !kind.is_replaceable() {
             return Err(Error::WrongEventKind);
         }
-        let mut iter = self.akc_iter_scoped(
+        let iter = self.akc_iter_scoped(
             txn,
             scope,
             author.as_bytes(),
@@ -1695,14 +1681,16 @@ impl Lmdb {
             Timestamp::min(),
             Timestamp::max(),
         )?;
-        if let Some(result) = iter.next() {
+
+        for result in iter {
             let (_key, id_bytes) = result?;
-            return self.get_event_by_id_in_txn(
-                txn,
-                scope,
-                &EventId::from_slice(id_bytes).unwrap(),
-            );
+            if let Some(event_borrow) =
+                self.get_event_by_id_in_txn(txn, scope, &EventId::from_slice(id_bytes).unwrap())?
+            {
+                return Ok(Some(event_borrow));
+            }
         }
+
         Ok(None)
     }
 
@@ -1724,6 +1712,7 @@ impl Lmdb {
             &Timestamp::min(),
             &Timestamp::max(),
         )?;
+
         for result in iter {
             let (_key, id_bytes) = result?;
             if let Some(event_borrow) =
@@ -1734,6 +1723,7 @@ impl Lmdb {
                 }
             }
         }
+
         Ok(None)
     }
 
@@ -1993,14 +1983,14 @@ impl Lmdb {
     pub(crate) fn scoped(&self, scope_name: &str) -> ScopedView<'_> {
         let scope = Scope::named(scope_name).unwrap_or_else(|_| {
             // This should never happen since we validate scope_name earlier
-            tracing::warn!("Invalid scope name '{}', falling back to default scope", scope_name);
+            tracing::warn!(
+                "Invalid scope name '{}', falling back to default scope",
+                scope_name
+            );
             Scope::Default
         });
-        
-        ScopedView {
-            db: self,
-            scope,
-        }
+
+        ScopedView { db: self, scope }
     }
 
     pub(crate) fn unscoped(&self) -> ScopedView<'_> {

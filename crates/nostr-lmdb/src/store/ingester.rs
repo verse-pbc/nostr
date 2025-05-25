@@ -148,12 +148,10 @@ impl Ingester {
 
         // Remove replaceable events being replaced
         if event.kind.is_replaceable() {
-            if let Some(stored_event_borrow) = self.db.find_replaceable_event_in_txn(
-                &txn,
-                &scope,
-                &event.pubkey,
-                event.kind,
-            )? {
+            if let Some(stored_event_borrow) =
+                self.db
+                    .find_replaceable_event_in_txn(&txn, &scope, &event.pubkey, event.kind)?
+            {
                 if stored_event_borrow.created_at > event.created_at
                     || (stored_event_borrow.created_at == event.created_at
                         && stored_event_borrow.id > event.id.as_bytes())
@@ -213,8 +211,7 @@ impl Ingester {
         }
 
         // Store and index the event
-        self.db
-            .store_in_scope(&mut txn, &scope, fbb, &event)?;
+        self.db.store_in_scope(&mut txn, &scope, fbb, &event)?;
 
         // Commit
         txn.commit()?;
@@ -230,7 +227,7 @@ impl Ingester {
     ) -> nostr::Result<bool, Error> {
         // Convert to Scope
         let scope = Lmdb::to_scope(scope_str)?;
-        
+
         // Acquire read txn
         let read_txn = self.db.read_txn()?;
 

@@ -129,7 +129,6 @@ pub use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod store;
 
-
 use self::store::Store;
 
 /// A view into a specific scope of the Nostr LMDB database.
@@ -160,7 +159,7 @@ impl NostrLMDB {
     {
         let store = Store::open(path).map_err(DatabaseError::backend)?;
         let registry = store.create_registry().map_err(DatabaseError::backend)?;
-        
+
         Ok(Self {
             db: store,
             registry,
@@ -284,7 +283,6 @@ impl NostrEventsDatabase for ScopedView<'_> {
         event_id: &'b NostrEventId,
     ) -> BoxedFuture<'b, Result<DatabaseEventStatus, DatabaseError>> {
         Box::pin(async move {
-            // TODO: Add `event_is_deleted_in_scope` to `Store` to accurately reflect deletion status.
             match self.event_by_id(*event_id).await? {
                 Some(_) => Ok(DatabaseEventStatus::Saved),
                 None => Ok(DatabaseEventStatus::NotExistent),
@@ -355,17 +353,19 @@ impl NostrLMDB {
         if let Scope::Named { .. } = scope {
             if let Some(registry) = &self.registry {
                 // Register the scope in the registry - this is critical for proper scope management
-                self.db.register_scope(registry, scope).map_err(DatabaseError::backend)?;
+                self.db
+                    .register_scope(registry, scope)
+                    .map_err(DatabaseError::backend)?;
             }
         }
-        
+
         let view = ScopedView {
             db: self,
             scope: scope.clone(),
         };
         Ok(view)
     }
-    
+
     /// Create a view for the default (unscoped) database
     pub fn unscoped(&self) -> ScopedView<'_> {
         ScopedView {
@@ -373,11 +373,15 @@ impl NostrLMDB {
             scope: Scope::Default,
         }
     }
-    
+
     /// List all registered scopes in the database
     pub fn list_scopes(&self) -> Result<Vec<Scope>, DatabaseError> {
         // Pass the singleton registry to the get_registry_scopes method
-        match self.db.get_registry_scopes(self.registry.as_ref()).map_err(DatabaseError::backend)? {
+        match self
+            .db
+            .get_registry_scopes(self.registry.as_ref())
+            .map_err(DatabaseError::backend)?
+        {
             Some(scopes) => Ok(scopes),
             None => Ok(vec![Scope::Default]),
         }
@@ -790,7 +794,7 @@ mod tests {
 
         let scope1_name = "scope1";
         let scope2_name = "scope2";
-        
+
         let scope1 = Scope::named(scope1_name).unwrap();
         let scope2 = Scope::named(scope2_name).unwrap();
 
@@ -944,7 +948,7 @@ mod tests {
         assert!(unscoped_view_res.is_ok());
         let _unscoped_view = unscoped_view_res.unwrap();
         assert!(_unscoped_view.scope.is_default());
-        
+
         // Test creating an invalid scope directly
         // This won't compile because Scope::named validates at compile time
         // but we can test database operations with an empty string

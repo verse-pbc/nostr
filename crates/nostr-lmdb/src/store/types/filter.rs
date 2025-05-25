@@ -39,8 +39,6 @@ impl DatabaseFilter {
             return false;
         }
 
-        // TODO: review this code
-
         // Match
         self.generic_tags.iter().all(|(tag_name, set)| {
             event.tags.iter().any(|tag| {

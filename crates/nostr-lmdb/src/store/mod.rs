@@ -42,19 +42,26 @@ impl Store {
 
         Ok(Self { db, ingester })
     }
-    
+
     /// Create a GlobalScopeRegistry for this store
     pub fn create_registry(&self) -> Result<Option<std::sync::Arc<GlobalScopeRegistry>>, Error> {
         self.db.create_registry()
     }
-    
+
     /// Register a scope in the registry
-    pub fn register_scope(&self, registry: &std::sync::Arc<GlobalScopeRegistry>, scope: &scoped_heed::Scope) -> Result<(), Error> {
+    pub fn register_scope(
+        &self,
+        registry: &std::sync::Arc<GlobalScopeRegistry>,
+        scope: &scoped_heed::Scope,
+    ) -> Result<(), Error> {
         self.db.register_scope(registry, scope)
     }
-    
+
     /// Get all scopes from the registry
-    pub fn get_registry_scopes(&self, registry: Option<&Arc<GlobalScopeRegistry>>) -> Result<Option<Vec<scoped_heed::Scope>>, Error> {
+    pub fn get_registry_scopes(
+        &self,
+        registry: Option<&Arc<GlobalScopeRegistry>>,
+    ) -> Result<Option<Vec<scoped_heed::Scope>>, Error> {
         if let Some(reg) = registry {
             // Use the provided registry
             self.db.get_registry_scopes(Some(reg))
@@ -114,7 +121,9 @@ impl Store {
         coordinate: &'a CoordinateBorrow<'a>,
     ) -> Result<Option<Timestamp>, Error> {
         let txn = self.db.read_txn()?;
-        let when = self.db.when_is_coordinate_deleted(&txn, &Scope::Default, coordinate)?;
+        let when = self
+            .db
+            .when_is_coordinate_deleted(&txn, &Scope::Default, coordinate)?;
         txn.commit()?;
         Ok(when)
     }
@@ -195,7 +204,7 @@ impl Store {
             }
             Scope::Default => None,
         };
-        
+
         let (item, rx) = IngesterItem::with_feedback(event, scope_string);
 
         // Send to the ingester
@@ -205,14 +214,10 @@ impl Store {
         rx.await?
     }
 
-    pub async fn query_in_scope(
-        &self,
-        scope: &Scope,
-        filter: Filter,
-    ) -> Result<Vec<Event>, Error> {
+    pub async fn query_in_scope(&self, scope: &Scope, filter: Filter) -> Result<Vec<Event>, Error> {
         let db_clone = self.db.clone();
         let scope_clone = scope.clone();
-        
+
         task::spawn_blocking(move || {
             let internal_sv = match &scope_clone {
                 Scope::Named { name, .. } => {
@@ -235,7 +240,7 @@ impl Store {
     ) -> Result<Option<Event>, Error> {
         let db_clone = self.db.clone();
         let scope_clone = scope.clone();
-        
+
         task::spawn_blocking(move || {
             let internal_sv = match &scope_clone {
                 Scope::Named { name, .. } => {
@@ -251,14 +256,10 @@ impl Store {
         .await?
     }
 
-    pub async fn count_in_scope(
-        &self,
-        scope: &Scope,
-        filter: Filter,
-    ) -> Result<usize, Error> {
+    pub async fn count_in_scope(&self, scope: &Scope, filter: Filter) -> Result<usize, Error> {
         let db_clone = self.db.clone();
         let scope_clone = scope.clone();
-        
+
         task::spawn_blocking(move || {
             let internal_sv = match &scope_clone {
                 Scope::Named { name, .. } => {
