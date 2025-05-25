@@ -1166,42 +1166,42 @@ impl Lmdb {
 
         let ci_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("ci_index")
+            .name("ci")
             .create(&mut txn)?;
 
         let tc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("tc_index")
+            .name("tci")
             .create(&mut txn)?;
 
         let ac_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("ac_index")
+            .name("aci")
             .create(&mut txn)?;
 
         let akc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("akc_index")
+            .name("akci")
             .create(&mut txn)?;
 
         let atc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("atc_index")
+            .name("atci")
             .create(&mut txn)?;
 
         let ktc_index_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("ktc_index")
+            .name("ktci")
             .create(&mut txn)?;
 
         let deleted_ids_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("deleted_ids")
+            .name("deleted-ids")
             .create(&mut txn)?;
 
         let deleted_coordinates_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
-            .name("deleted_coordinates")
+            .name("deleted-coordinates")
             .create(&mut txn)?;
 
         txn.commit()?;
