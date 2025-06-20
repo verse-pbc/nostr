@@ -25,8 +25,8 @@
 //! ### Basic Usage
 //!
 //! ```no_run
-//! use nostr_lmdb::{NostrLMDB, NostrEventsDatabase};
 //! use nostr_lmdb::nostr::{EventBuilder, Filter, Keys, Kind};
+//! use nostr_lmdb::{NostrEventsDatabase, NostrLMDB};
 //! use scoped_heed::Scope;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,6 +130,7 @@ pub use scoped_heed::{GlobalScopeRegistry, Scope};
 mod store;
 
 use self::store::Store;
+pub use self::store::{LmdbConfig, ReadTransaction, WriteTransaction};
 
 /// A view into a specific scope of the Nostr LMDB database.
 ///
@@ -151,19 +152,69 @@ pub struct NostrLMDB {
 }
 
 impl NostrLMDB {
-    /// Open LMDB database
+    /// Open LMDB database with default configuration
     #[inline]
     pub fn open<P>(path: P) -> Result<Self, DatabaseError>
     where
         P: AsRef<Path>,
     {
-        let store = Store::open(path).map_err(DatabaseError::backend)?;
+        Self::open_with_config(path, LmdbConfig::default())
+    }
+
+    /// Open LMDB database with custom configuration
+    #[inline]
+    pub fn open_with_config<P>(path: P, config: LmdbConfig) -> Result<Self, DatabaseError>
+    where
+        P: AsRef<Path>,
+    {
+        let store = Store::open_with_config(path, config).map_err(DatabaseError::backend)?;
         let registry = store.create_registry().map_err(DatabaseError::backend)?;
 
         Ok(Self {
             db: store,
             registry,
         })
+    }
+
+    /// Open LMDB database with configuration from environment variables
+    #[inline]
+    pub fn open_with_env_config<P>(path: P) -> Result<Self, DatabaseError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_with_config(path, LmdbConfig::from_env())
+    }
+    
+    /// Create a new write transaction
+    pub fn write_transaction(&self) -> Result<WriteTransaction<'_>, DatabaseError> {
+        self.db.write_transaction().map_err(DatabaseError::backend)
+    }
+    
+    /// Create a new read transaction
+    pub fn read_transaction(&self) -> Result<ReadTransaction<'_>, DatabaseError> {
+        self.db.read_transaction().map_err(DatabaseError::backend)
+    }
+    
+    /// Save an event within a transaction
+    pub fn save_event_with_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        event: &NostrEvent,
+    ) -> Result<SaveEventStatus, DatabaseError> {
+        self.db.save_event_with_txn(txn, scope, event)
+            .map_err(DatabaseError::backend)
+    }
+    
+    /// Delete events matching a filter within a transaction
+    pub fn delete_with_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        filter: NostrFilter,
+    ) -> Result<usize, DatabaseError> {
+        self.db.delete_with_txn(txn, scope, filter)
+            .map_err(DatabaseError::backend)
     }
 }
 
@@ -266,7 +317,7 @@ impl NostrEventsDatabase for NostrLMDB {
 impl NostrDatabaseWipe for NostrLMDB {
     #[inline]
     fn wipe(&self) -> BoxedFuture<Result<(), DatabaseError>> {
-        Box::pin(async move { self.db.wipe().await.map_err(DatabaseError::backend) })
+        Box::pin(async move { self.db.wipe().map_err(DatabaseError::backend) })
     }
 }
 
@@ -386,6 +437,88 @@ impl NostrLMDB {
             None => Ok(vec![Scope::Default]),
         }
     }
+
+    // Transaction API methods
+
+    /// Begin a new read transaction
+    pub fn begin_read(&self) -> Result<ReadTransaction<'_>, DatabaseError> {
+        self.db.read_transaction().map_err(DatabaseError::backend)
+    }
+
+    /// Begin a new write transaction
+    pub fn begin_write(&self) -> Result<WriteTransaction<'_>, DatabaseError> {
+        self.db.write_transaction().map_err(DatabaseError::backend)
+    }
+
+    /// Save an event within a transaction (unscoped)
+    pub fn save_event_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        event: &NostrEvent,
+    ) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .save_event_with_txn(txn, &Scope::Default, event)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Save an event within a transaction in a specific scope
+    pub fn save_event_txn_scoped(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        event: &NostrEvent,
+    ) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .save_event_with_txn(txn, scope, event)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Delete events matching a filter within a transaction (unscoped)
+    pub fn delete_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        filter: NostrFilter,
+    ) -> Result<usize, DatabaseError> {
+        self.db
+            .delete_with_txn(txn, &Scope::Default, filter)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Query events within a read transaction (unscoped)
+    pub fn query_txn(
+        &self,
+        txn: &ReadTransaction,
+        filter: NostrFilter,
+    ) -> Result<Events, DatabaseError> {
+        let events = self
+            .db
+            .query_with_txn(txn, &Scope::Default, filter.clone())
+            .map_err(DatabaseError::backend)?;
+
+        let mut events_collection = Events::new(&filter);
+        for event in events {
+            events_collection.insert(event);
+        }
+        Ok(events_collection)
+    }
+
+    /// Delete a specific event by ID within a transaction (unscoped)
+    pub fn delete_by_id_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        event_id: &NostrEventId,
+    ) -> Result<bool, DatabaseError> {
+        self.db
+            .delete_by_id_with_txn(txn, &Scope::Default, event_id)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Check if an event exists by its ID (unscoped)
+    pub async fn has_event(&self, event_id: &NostrEventId) -> Result<bool, DatabaseError> {
+        // Direct LMDB access - no spawn_blocking needed for reads
+        self.db.has_event(event_id).map_err(DatabaseError::backend)
+    }
+
 }
 
 impl ScopedView<'_> {
@@ -442,6 +575,57 @@ impl ScopedView<'_> {
             .await
             .map_err(DatabaseError::backend)
     }
+
+    // Transaction API methods for scoped operations
+
+    /// Save an event within a transaction in this view's scope
+    pub fn save_event_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        event: &NostrEvent,
+    ) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .db
+            .save_event_with_txn(txn, &self.scope, event)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Delete events matching a filter within a transaction in this view's scope
+    pub fn delete_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        filter: NostrFilter,
+    ) -> Result<usize, DatabaseError> {
+        self.db
+            .db
+            .delete_with_txn(txn, &self.scope, filter)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Query events within a read transaction in this view's scope
+    pub fn query_txn(
+        &self,
+        txn: &ReadTransaction,
+        filter: NostrFilter,
+    ) -> Result<Vec<NostrEvent>, DatabaseError> {
+        self.db
+            .db
+            .query_with_txn(txn, &self.scope, filter)
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Delete a specific event by ID within a transaction in this view's scope
+    pub fn delete_by_id_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        event_id: &NostrEventId,
+    ) -> Result<bool, DatabaseError> {
+        self.db
+            .db
+            .delete_by_id_with_txn(txn, &self.scope, event_id)
+            .map_err(DatabaseError::backend)
+    }
+
 }
 
 #[cfg(test)]
