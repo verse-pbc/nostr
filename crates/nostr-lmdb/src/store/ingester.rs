@@ -2,42 +2,103 @@
 // Copyright (c) 2023-2025 Rust Nostr Developers
 // Distributed under the MIT software license
 
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread;
+//! # Event Ingester with Automatic Batching
+//!
+//! The ingester provides asynchronous event processing through a dedicated background thread
+//! with automatic batching for optimal performance.
+//!
+//! ## Automatic Batching
+//!
+//! The ingester automatically batches ALL available events in the channel. This provides:
+//! - Optimal write performance without manual batching
+//! - Reduced LMDB transaction overhead  
+//! - Transparent to the caller - just use `save_event()` as normal
+//! - No artificial limits - processes all available events in a single transaction
+//!
+//! ## Ingester-based vs Transaction-based Operations
+//!
+//! ### Ingester-based (Async with Auto-batching):
+//! - `save_event()` - Async processing with automatic batching
+//! - `save_event_in_scope()` - Scoped async processing with automatic batching
+//! - Events are collected and committed in batches automatically
+//! - Non-blocking for caller with optional feedback
+//!
+//! ### Transaction-based (Direct Control):
+//! - `save_event_txn()` - Single event within your transaction
+//! - Direct database access, bypasses ingester
+//! - Full control over transaction boundaries
+//! - Use when you need precise transaction control or atomic operations
+//!
+//! ## When to Use Each Approach
+//!
+//! - **Ingester (default)**: For most use cases, especially high-throughput scenarios
+//! - **Transactions**: When you need atomic operations across multiple changes
 
-use heed::RwTxn;
-use nostr::nips::nip01::Coordinate;
-use nostr::{Event, EventId, Kind};
-use nostr_database::{FlatBufferBuilder, RejectedReason, SaveEventStatus};
-// We're using Scope from super::lmdb
+use flume::{Receiver, Sender};
+
+use nostr::Event;
+use nostr_database::{FlatBufferBuilder, SaveEventStatus};
+use scoped_heed::Scope;
 use tokio::sync::oneshot;
 
 use super::error::Error;
 use super::lmdb::Lmdb;
+use super::Filter;
+
+enum OperationResult {
+    Save(Result<SaveEventStatus, Error>),
+    Delete(Result<(), Error>),
+}
+
+
+pub(super) enum IngesterOperation {
+    SaveEvent {
+        event: Event,
+        tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
+    },
+    Delete {
+        filter: Filter,
+        tx: Option<oneshot::Sender<Result<(), Error>>>,
+    },
+}
 
 pub(super) struct IngesterItem {
-    event: Event,
-    scope: Option<String>,
-    tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
+    pub(super) scope: Scope,
+    pub(super) operation: IngesterOperation,
 }
 
 impl IngesterItem {
-    // #[inline]
-    // pub(super) fn without_feedback(event: Event) -> Self {
-    //     Self { event, tx: None }
-    // }
-
     #[must_use]
-    pub(super) fn with_feedback(
+    pub(super) fn save_event_with_feedback(
         event: Event,
-        scope: Option<String>,
+        scope: Scope,
     ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
-                event,
                 scope,
-                tx: Some(tx),
+                operation: IngesterOperation::SaveEvent {
+                    event,
+                    tx: Some(tx),
+                },
+            },
+            rx,
+        )
+    }
+
+    #[must_use]
+    pub(super) fn delete_with_feedback(
+        filter: Filter,
+        scope: Scope,
+    ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                scope,
+                operation: IngesterOperation::Delete {
+                    filter,
+                    tx: Some(tx),
+                },
             },
             rx,
         )
@@ -51,10 +112,29 @@ pub(super) struct Ingester {
 }
 
 impl Ingester {
+    fn process_operation(
+        &self,
+        txn: &mut heed::RwTxn,
+        scope: &Scope,
+        operation: &IngesterOperation,
+        fbb: &mut FlatBufferBuilder,
+    ) -> OperationResult {
+        match operation {
+            IngesterOperation::SaveEvent { event, .. } => {
+                let result = self.db.save_event_with_txn(txn, scope, fbb, event);
+                OperationResult::Save(result)
+            }
+            IngesterOperation::Delete { filter, .. } => {
+                let result = self.db.delete_in_scope(txn, scope, filter.clone()).map(|_| ());
+                OperationResult::Delete(result)
+            }
+        }
+    }
+
     /// Build and spawn a new ingester
     pub(super) fn run(db: Lmdb) -> Sender<IngesterItem> {
-        // Create new asynchronous channel
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Create new flume channel (unbounded for maximum performance)
+        let (tx, rx) = flume::unbounded();
 
         // Construct and spawn ingester
         let ingester = Self { db, rx };
@@ -65,231 +145,131 @@ impl Ingester {
     }
 
     fn spawn_ingester(self) {
-        thread::spawn(move || {
-            #[cfg(debug_assertions)]
-            tracing::debug!("Ingester thread started");
-
-            let mut fbb = FlatBufferBuilder::with_capacity(70_000);
-
-            // Listen for items
-            while let Ok(IngesterItem { event, scope, tx }) = self.rx.recv() {
-                // Ingest
-                let res = self.ingest_event(event, scope, &mut fbb);
-
-                // If sender is available send the `Result` otherwise log as error
-                match tx {
-                    // Send to receiver
-                    Some(tx) => {
-                        let _ = tx.send(res);
-                    }
-                    // Log error if `Result::Err`
-                    None => {
-                        if let Err(e) = res {
-                            tracing::error!(error = %e, "Event ingestion failed.");
-                        }
-                    }
-                }
-            }
-
-            #[cfg(debug_assertions)]
-            tracing::debug!("Ingester thread exited");
+        tokio::task::spawn_blocking(move || {
+            self.run_ingester_loop();
         });
     }
+    
+    fn run_ingester_loop(self) {
+        #[cfg(debug_assertions)]
+        tracing::debug!("Ingester thread started with commit batching");
 
-    fn ingest_event(
-        &self,
-        event: Event,
-        scope_string: Option<String>,
-        fbb: &mut FlatBufferBuilder,
-    ) -> nostr::Result<SaveEventStatus, Error> {
-        // Convert to Scope for internal use
-        let scope_str = scope_string.as_deref();
-        let scope = Lmdb::to_scope(scope_str)?;
-        if event.kind.is_ephemeral() {
-            return Ok(SaveEventStatus::Rejected(RejectedReason::Ephemeral));
-        }
-
-        // Initial read txn checks
-        {
-            // Acquire read txn
-            let read_txn = self.db.read_txn()?;
-
-            // Already exists
-            if self
-                .db
-                .has_event_in_scope(&read_txn, &scope, event.id.as_bytes())?
-            {
-                return Ok(SaveEventStatus::Rejected(RejectedReason::Duplicate));
-            }
-
-            // Reject event if ID was deleted
-            if self.db.is_deleted(&read_txn, &scope, &event.id)? {
-                return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
-            }
-
-            // Reject event if ADDR was deleted after it's created_at date
-            // (non-parameterized or parameterized)
-            if let Some(coordinate) = event.coordinate() {
-                if let Some(time) =
-                    self.db
-                        .when_is_coordinate_deleted(&read_txn, &scope, &coordinate)?
-                {
-                    if event.created_at <= time {
-                        return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
-                    }
-                }
-            }
-
-            read_txn.commit()?;
-        }
-
-        // Acquire write transaction
-        let mut txn = self.db.write_txn()?;
-
-        // Remove replaceable events being replaced
-        if event.kind.is_replaceable() {
-            if let Some(stored_event_borrow) =
-                self.db
-                    .find_replaceable_event_in_txn(&txn, &scope, &event.pubkey, event.kind)?
-            {
-                if stored_event_borrow.created_at > event.created_at
-                    || (stored_event_borrow.created_at == event.created_at
-                        && stored_event_borrow.id > event.id.as_bytes())
-                {
-                    txn.abort();
-                    return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
-                }
-                // New event replaces stored_event_borrow, remove the old one
-                let id_to_remove = EventId::from_slice(stored_event_borrow.id).map_err(|_| {
-                    Error::Other(
-                        "Failed to parse EventId for replaceable event removal".to_string(),
-                    )
-                })?;
-                self.db
-                    .remove_event_in_scope(&mut txn, &scope, &id_to_remove)?;
-            }
-        }
-
-        // Remove parameterized replaceable events being replaced
-        if event.kind.is_addressable() {
-            if let Some(identifier) = event.tags.identifier() {
-                let coordinate: Coordinate =
-                    Coordinate::new(event.kind, event.pubkey).identifier(identifier);
-
-                if let Some(stored_event_borrow) =
-                    self.db
-                        .find_addressable_event_in_txn(&txn, &scope, &coordinate)?
-                {
-                    if stored_event_borrow.created_at > event.created_at
-                        || (stored_event_borrow.created_at == event.created_at
-                            && stored_event_borrow.id > event.id.as_bytes())
-                    {
-                        txn.abort();
-                        return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
-                    }
-                    // New event replaces stored_event_borrow, remove the old one
-                    let id_to_remove =
-                        EventId::from_slice(stored_event_borrow.id).map_err(|_| {
-                            Error::Other(
-                                "Failed to parse EventId for addressable event removal".to_string(),
-                            )
-                        })?;
-                    self.db
-                        .remove_event_in_scope(&mut txn, &scope, &id_to_remove)?;
-                }
-            }
-        }
-
-        // Handle deletion events
-        if let Kind::EventDeletion = event.kind {
-            let invalid: bool = self.handle_deletion_event(&mut txn, &event, scope_str)?;
-
-            if invalid {
-                txn.abort();
-                return Ok(SaveEventStatus::Rejected(RejectedReason::InvalidDelete));
-            }
-        }
-
-        // Store and index the event
-        self.db.store_in_scope(&mut txn, &scope, fbb, &event)?;
-
-        // Commit
-        txn.commit()?;
-
-        Ok(SaveEventStatus::Success)
-    }
-
-    fn handle_deletion_event(
-        &self,
-        txn: &mut RwTxn,
-        event: &Event,
-        scope_str: Option<&str>,
-    ) -> nostr::Result<bool, Error> {
-        // Convert to Scope
-        let scope = Lmdb::to_scope(scope_str)?;
-
-        // Acquire read txn
-        let read_txn = self.db.read_txn()?;
-
-        for id in event.tags.event_ids() {
-            if let Some(target) = self.db.get_event_by_id_in_txn(&read_txn, &scope, id)? {
-                // Author must match
-                if target.pubkey != event.pubkey.as_bytes() {
-                    return Ok(true);
-                }
-
-                // Mark as deleted and remove event
-                self.db.mark_deleted(txn, &scope, id)?;
-                let target_id = EventId::from_slice(target.id).map_err(|_| {
-                    Error::Other("Invalid EventId slice from target event for deletion".to_string())
-                })?;
-                self.db.remove_event_in_scope(txn, &scope, &target_id)?;
-            }
-        }
-
-        for coordinate in event.tags.coordinates() {
-            // Author must match
-            if coordinate.public_key != event.pubkey {
-                return Ok(true);
-            }
-
-            // Mark deleted
-            self.db
-                .mark_coordinate_deleted(txn, &scope, &coordinate.borrow(), event.created_at)?;
-
-            // Remove events specified by the coordinate tag, at or before the deletion event's timestamp.
-            let found_events_for_coord = self.db.find_events_by_coordinate_scoped(
-                &read_txn, // Use read_txn for finding
-                &scope,    // scope
-                coordinate,
-                event.created_at, // Delete events at or before the deletion event's timestamp
-            )?;
-
-            // Debug print
+        let mut fbb = FlatBufferBuilder::with_capacity(70_000);
+        
+        // Process events as they arrive
+        while let Ok(first_item) = self.rx.recv() {
+            let mut batch = vec![first_item];
+            // Drain all currently available items
+            batch.extend(self.rx.drain());
+            
             #[cfg(debug_assertions)]
-            tracing::debug!(
-                "Found {} events for coordinate {:?}:{}:{:?} (created_at <= {})",
-                found_events_for_coord.len(),
-                coordinate.kind,
-                coordinate.public_key,
-                coordinate.identifier,
-                event.created_at
-            );
-
-            for event_to_del_borrow in found_events_for_coord {
-                // Ensure we are deleting an event of the kind specified in the coordinate tag
-                if event_to_del_borrow.kind == coordinate.kind.as_u16() {
-                    let id_to_del = EventId::from_slice(event_to_del_borrow.id)
-                        .map_err(|_| Error::Other("Failed to parse EventId in handle_deletion_event for coordinate target".to_string()))?;
-                    self.db.remove_event_in_scope(txn, &scope, &id_to_del)?;
-                    // Optional: self.db.mark_deleted(txn, scope, &id_to_del)?; if not already covered
-                }
-            }
-            // The old remove_replaceable / remove_addressable calls are replaced by the loop above
+            let batch_count = batch.len();
+            
+            // Process the batch in a transaction
+            let results = self.process_batch_in_transaction(batch, &mut fbb);
+            
+            #[cfg(debug_assertions)]
+            tracing::debug!("Processed batch of {} operations", batch_count);
+            
+            // Send results back to callers
+            self.send_batch_results(results);
         }
 
-        read_txn.commit()?;
-
-        Ok(false)
+        #[cfg(debug_assertions)]
+        tracing::debug!("Ingester thread exited");
+    }
+    
+    fn process_batch_in_transaction(
+        &self,
+        batch: Vec<IngesterItem>,
+        fbb: &mut FlatBufferBuilder,
+    ) -> Vec<(IngesterItem, OperationResult)> {
+        // Group by scope for transaction efficiency
+        let mut by_scope: std::collections::HashMap<Scope, Vec<IngesterItem>> = std::collections::HashMap::new();
+        for item in batch {
+            by_scope.entry(item.scope.clone()).or_default().push(item);
+        }
+        
+        let mut all_results = Vec::new();
+        
+        // Process each scope in its own transaction
+        for (scope, items) in by_scope {
+            match self.db.write_txn() {
+                Ok(mut txn) => {
+                    let mut results = Vec::new();
+                    let mut has_error = false;
+                    
+                    // Process all items for this scope
+                    for item in items {
+                        let result = self.process_operation(&mut txn, &scope, &item.operation, fbb);
+                        if matches!(&result, OperationResult::Save(Err(_)) | OperationResult::Delete(Err(_))) {
+                            has_error = true;
+                        }
+                        results.push((item, result));
+                    }
+                    
+                    // Commit or abort based on errors
+                    if has_error {
+                        txn.abort();
+                        tracing::warn!("Transaction aborted due to errors for scope: {:?}", scope);
+                    } else {
+                        match txn.commit() {
+                            Ok(()) => {
+                                #[cfg(debug_assertions)]
+                                tracing::debug!("Transaction committed successfully for scope: {:?}", scope);
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to commit transaction");
+                                // Convert all results to commit error
+                                let error = Error::from(e);
+                                for (_, result) in &mut results {
+                                    match result {
+                                        OperationResult::Save(res) => *res = Err(error.clone()),
+                                        OperationResult::Delete(res) => *res = Err(error.clone()),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    all_results.extend(results);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create write transaction");
+                    // Send error for all items in this scope
+                    for item in items {
+                        let error_result = match &item.operation {
+                            IngesterOperation::SaveEvent { .. } => OperationResult::Save(Err(e.clone())),
+                            IngesterOperation::Delete { .. } => OperationResult::Delete(Err(e.clone())),
+                        };
+                        all_results.push((item, error_result));
+                    }
+                }
+            }
+        }
+        
+        all_results
+    }
+    
+    fn send_batch_results(&self, results: Vec<(IngesterItem, OperationResult)>) {
+        for (item, result) in results {
+            match (item.operation, result) {
+                (IngesterOperation::SaveEvent { tx, .. }, OperationResult::Save(res)) => {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(res);
+                    } else if let Err(e) = res {
+                        tracing::error!(error = %e, "Event save failed in batch");
+                    }
+                }
+                (IngesterOperation::Delete { tx, .. }, OperationResult::Delete(res)) => {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(res);
+                    } else if let Err(e) = res {
+                        tracing::error!(error = %e, "Delete operation failed in batch");
+                    }
+                }
+                _ => unreachable!("Mismatched operation and result types"),
+            }
+        }
     }
 }

@@ -5,30 +5,35 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use async_utility::task;
+use flume::Sender;
+
 use nostr_database::prelude::*;
+use nostr_database::{FlatBufferBuilder, SaveEventStatus};
 use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod error;
 mod ingester;
 mod lmdb;
+mod transaction;
 mod types;
 
-use self::error::Error;
+pub use self::error::Error;
 use self::ingester::{Ingester, IngesterItem};
 use self::lmdb::Lmdb;
+pub use self::lmdb::LmdbConfig;
+pub use self::transaction::{ReadTransaction, WriteTransaction};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Store {
     db: Lmdb,
     ingester: Sender<IngesterItem>,
 }
 
 impl Store {
-    pub fn open<P>(path: P) -> Result<Store, Error>
+    
+    pub fn open_with_config<P>(path: P, config: LmdbConfig) -> Result<Store, Error>
     where
         P: AsRef<Path>,
     {
@@ -37,7 +42,7 @@ impl Store {
         // Create the directory if it doesn't exist
         fs::create_dir_all(path)?;
 
-        let db: Lmdb = Lmdb::new(path)?;
+        let db: Lmdb = Lmdb::with_config(path, config)?;
         let ingester: Sender<IngesterItem> = Ingester::run(db.clone());
 
         Ok(Self { db, ingester })
@@ -72,22 +77,12 @@ impl Store {
         }
     }
 
-    #[inline]
-    async fn interact<F, R>(&self, f: F) -> Result<R, Error>
-    where
-        F: FnOnce(Lmdb) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let db = self.db.clone();
-        Ok(task::spawn_blocking(move || f(db)).await?)
-    }
 
     /// Store an event.
     pub async fn save_event(&self, event: &Event) -> Result<SaveEventStatus, Error> {
-        let (item, rx) = IngesterItem::with_feedback(event.clone(), None);
+        let (item, rx) = IngesterItem::save_event_with_feedback(event.clone(), Scope::Default);
 
         // Send to the ingester
-        // This will never block the current thread according to `std::sync::mpsc::Sender` docs
         self.ingester.send(item).map_err(|_| Error::MpscSend)?;
 
         // Wait for a reply
@@ -151,42 +146,39 @@ impl Store {
     }
 
     pub async fn delete(&self, filter: Filter) -> Result<(), Error> {
-        self.interact(move |db| {
-            let read_txn = db.read_txn()?;
-            let mut txn = db.write_txn()?;
+        let (item, rx) = IngesterItem::delete_with_feedback(filter, Scope::Default);
 
-            db.delete(&read_txn, &mut txn, filter)?;
+        // Send to the ingester
+        self.ingester.send(item).map_err(|_| Error::MpscSend)?;
 
-            read_txn.commit()?;
-            txn.commit()?;
-
-            Ok(())
-        })
-        .await?
+        // Wait for a reply
+        rx.await?
     }
 
-    pub async fn wipe(&self) -> Result<(), Error> {
-        self.interact(move |db| {
-            let mut txn = db.write_txn()?;
-            db.wipe(&mut txn)?;
-            txn.commit()?;
-            Ok(())
-        })
-        .await?
+    pub fn wipe(&self) -> Result<(), Error> {
+        let mut txn = self.db.write_txn()?;
+        self.db.wipe(&mut txn)?;
+        txn.commit()?;
+        
+        Ok(())
     }
 
     // New scope-aware methods
     pub async fn delete_in_scope(&self, scope: &Scope, filter: Filter) -> Result<(), Error> {
-        let internal_sv = match scope {
-            Scope::Named { name, .. } => {
-                if name.is_empty() {
-                    return Err(Error::EmptyScope);
-                }
-                self.db.scoped(name) // self.db is Lmdb
+        // Validate scope if it's named
+        if let Scope::Named { name, .. } = scope {
+            if name.is_empty() {
+                return Err(Error::EmptyScope);
             }
-            Scope::Default => self.db.unscoped(),
-        };
-        internal_sv.delete(filter).await // Calls the new async delete on internal ScopedView
+        }
+
+        let (item, rx) = IngesterItem::delete_with_feedback(filter, scope.clone());
+
+        // Send to the ingester
+        self.ingester.send(item).map_err(|_| Error::MpscSend)?;
+
+        // Wait for a reply
+        rx.await?
     }
 
     pub async fn save_event_in_scope(
@@ -194,18 +186,14 @@ impl Store {
         scope: &Scope,
         event: Event,
     ) -> Result<SaveEventStatus, Error> {
-        // Convert Scope to Option<String> for the ingester
-        let scope_string = match scope {
-            Scope::Named { name, .. } => {
-                if name.is_empty() {
-                    return Err(Error::EmptyScope);
-                }
-                Some(name.clone())
+        // Validate scope if it's named
+        if let Scope::Named { name, .. } = scope {
+            if name.is_empty() {
+                return Err(Error::EmptyScope);
             }
-            Scope::Default => None,
-        };
+        }
 
-        let (item, rx) = IngesterItem::with_feedback(event, scope_string);
+        let (item, rx) = IngesterItem::save_event_with_feedback(event, scope.clone());
 
         // Send to the ingester
         self.ingester.send(item).map_err(|_| Error::MpscSend)?;
@@ -215,22 +203,26 @@ impl Store {
     }
 
     pub async fn query_in_scope(&self, scope: &Scope, filter: Filter) -> Result<Vec<Event>, Error> {
-        let db_clone = self.db.clone();
-        let scope_clone = scope.clone();
-
-        task::spawn_blocking(move || {
-            let internal_sv = match &scope_clone {
-                Scope::Named { name, .. } => {
-                    if name.is_empty() {
-                        return Err(Error::EmptyScope);
-                    }
-                    db_clone.scoped(name)
+        // Direct LMDB access - no spawn_blocking needed for reads
+        let internal_sv = match scope {
+            Scope::Named { name, .. } => {
+                if name.is_empty() {
+                    return Err(Error::EmptyScope);
                 }
-                Scope::Default => db_clone.unscoped(),
-            };
-            internal_sv.query(filter)
-        })
-        .await?
+                self.db.scoped(name)
+            }
+            Scope::Default => self.db.unscoped(),
+        };
+        
+        // Perform the query directly
+        let result = internal_sv.query(filter)?;
+        
+        // Yield to runtime if we processed many items
+        if result.len() > 100 {
+            tokio::task::yield_now().await;
+        }
+        
+        Ok(result)
     }
 
     pub async fn event_by_id_in_scope(
@@ -238,43 +230,123 @@ impl Store {
         scope: &Scope,
         event_id: EventId,
     ) -> Result<Option<Event>, Error> {
-        let db_clone = self.db.clone();
-        let scope_clone = scope.clone();
-
-        task::spawn_blocking(move || {
-            let internal_sv = match &scope_clone {
-                Scope::Named { name, .. } => {
-                    if name.is_empty() {
-                        return Err(Error::EmptyScope);
-                    }
-                    db_clone.scoped(name)
+        // Direct LMDB access - no spawn_blocking needed for reads
+        let internal_sv = match scope {
+            Scope::Named { name, .. } => {
+                if name.is_empty() {
+                    return Err(Error::EmptyScope);
                 }
-                Scope::Default => db_clone.unscoped(),
-            };
-            internal_sv.event_by_id(&event_id)
-        })
-        .await?
+                self.db.scoped(name)
+            }
+            Scope::Default => self.db.unscoped(),
+        };
+        
+        // Perform the lookup directly
+        internal_sv.event_by_id(&event_id)
     }
 
     pub async fn count_in_scope(&self, scope: &Scope, filter: Filter) -> Result<usize, Error> {
-        let db_clone = self.db.clone();
-        let scope_clone = scope.clone();
-
-        task::spawn_blocking(move || {
-            let internal_sv = match &scope_clone {
-                Scope::Named { name, .. } => {
-                    if name.is_empty() {
-                        return Err(Error::EmptyScope);
-                    }
-                    db_clone.scoped(name)
+        // Direct LMDB access - no spawn_blocking needed for reads
+        let internal_sv = match scope {
+            Scope::Named { name, .. } => {
+                if name.is_empty() {
+                    return Err(Error::EmptyScope);
                 }
-                Scope::Default => db_clone.unscoped(),
-            };
-            match internal_sv.count(filter) {
-                Ok(count_val) => Ok(count_val),
-                Err(e) => Err(e),
+                self.db.scoped(name)
             }
-        })
-        .await?
+            Scope::Default => self.db.unscoped(),
+        };
+        
+        // Perform the count directly
+        let count = internal_sv.count(filter)?;
+        
+        // Yield to runtime if the count operation was potentially heavy
+        if count > 1000 {
+            tokio::task::yield_now().await;
+        }
+        
+        Ok(count)
+    }
+
+    // Transaction management methods
+
+    /// Create a new read transaction
+    pub fn read_transaction(&self) -> Result<ReadTransaction<'_>, Error> {
+        ReadTransaction::new(&self.db)
+    }
+
+    /// Create a new write transaction
+    pub fn write_transaction(&self) -> Result<WriteTransaction<'_>, Error> {
+        WriteTransaction::new(&self.db)
+    }
+
+    /// Save an event within a transaction
+    pub fn save_event_with_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        event: &Event,
+    ) -> Result<SaveEventStatus, Error> {
+        // Create a FlatBufferBuilder
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Get the database reference first
+        let db = txn.db();
+
+        // Get mutable reference to the underlying RwTxn
+        let rwtxn = txn.as_mut().ok_or(Error::TransactionAlreadyCommitted)?;
+
+        // Use the transaction-aware method
+        db.save_event_with_txn(rwtxn, scope, &mut fbb, event)
+    }
+
+    /// Delete events matching a filter within a transaction
+    pub fn delete_with_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        filter: Filter,
+    ) -> Result<usize, Error> {
+        // Get the database reference first
+        let db = txn.db();
+
+        // Get mutable reference to the underlying RwTxn
+        let rwtxn = txn.as_mut().ok_or(Error::TransactionAlreadyCommitted)?;
+
+        // Query events to delete
+        let events = db.query_with_txn(rwtxn, scope, filter)?;
+        let count = events.len();
+
+        // Delete each event
+        for event in events {
+            db.delete_by_id_with_txn(rwtxn, scope, &event.id)?;
+        }
+
+        Ok(count)
+    }
+
+    /// Query events within a read transaction
+    pub fn query_with_txn(
+        &self,
+        txn: &ReadTransaction,
+        scope: &Scope,
+        filter: Filter,
+    ) -> Result<Vec<Event>, Error> {
+        txn.db().query_with_txn(txn, scope, filter)
+    }
+
+    /// Delete a specific event by ID within a transaction
+    pub fn delete_by_id_with_txn(
+        &self,
+        txn: &mut WriteTransaction,
+        scope: &Scope,
+        event_id: &EventId,
+    ) -> Result<bool, Error> {
+        // Get the database reference first
+        let db = txn.db();
+
+        let rwtxn = txn.as_mut().ok_or(Error::TransactionAlreadyCommitted)?;
+
+        db.delete_by_id_with_txn(rwtxn, scope, event_id)
     }
 }

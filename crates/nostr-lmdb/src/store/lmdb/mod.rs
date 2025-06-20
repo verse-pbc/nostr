@@ -6,31 +6,30 @@
 use std::collections::BTreeSet;
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
 
-use async_utility::task;
-use heed::{Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Env, EnvOpenOptions, RoTxn, RwTxn, WithTls};
 use nostr::event::borrow::EventBorrow;
+use nostr::event::tag::TagStandard;
+use nostr::nips::nip01::Coordinate;
+use nostr::{Event, EventId, Kind, Timestamp};
 use nostr_database::flatbuffers::FlatBufferDecodeBorrowed;
 use nostr_database::prelude::*;
 use nostr_database::{nostr, FlatBufferBuilder, FlatBufferEncode, RejectedReason, SaveEventStatus};
 use scoped_heed::{
     scoped_database_options, GlobalScopeRegistry, Scope, ScopedBytesDatabase, ScopedDbError,
 };
-use std::sync::Arc;
 
+mod config;
 mod index;
 
+pub use self::config::LmdbConfig;
 use super::error::Error;
 use super::types::DatabaseFilter;
 
 const EVENT_ID_ALL_ZEROS: [u8; 32] = [0; 32];
 const EVENT_ID_ALL_255: [u8; 32] = [255; 32];
 
-#[cfg(target_pointer_width = "64")]
-const MAP_SIZE: usize = 1024 * 1024 * 1024 * 32;
-
-#[cfg(target_pointer_width = "32")]
-const MAP_SIZE: usize = 0xFFFFF000;
 
 // Type alias for the complex iterator type to reduce clippy warnings
 type ScopedIterator<'txn> =
@@ -423,7 +422,7 @@ impl ScopedView<'_> {
 
     fn iterate_filter_until_limit<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         _scope: &Scope,
         filter: &DatabaseFilter,
         iter: ScopedIterator<'txn>,
@@ -991,90 +990,85 @@ impl ScopedView<'_> {
         Ok(current_event_count)
     }
 
-    pub async fn delete(&self, filter: Filter) -> Result<(), Error> {
+    pub fn delete(&self, filter: Filter) -> Result<(), Error> {
         let events_to_delete: Vec<Event> = self.query(filter)?;
+        
+        let mut wtxn = self.db.env.write_txn()?;
+        let scope_ref = &self.scope;
 
-        let db_clone = self.db.clone();
-        let scope_clone = self.scope.clone();
+        for event_val in events_to_delete {
+            let event_id_bytes = event_val.id.as_bytes();
 
-        task::spawn_blocking(move || {
-            let mut wtxn = db_clone.env.write_txn()?;
-            let scope_ref = &scope_clone;
+            self.db
+                .events_sdb
+                .delete(&mut wtxn, scope_ref, event_id_bytes)?;
 
-            for event_val in events_to_delete {
-                let event_id_bytes = event_val.id.as_bytes();
+            let ci_key_bytes =
+                index::make_ci_index_key(&event_val.created_at, event_val.id.as_bytes());
+            self.db
+                .ci_index_sdb
+                .delete(&mut wtxn, scope_ref, &ci_key_bytes)?;
 
-                db_clone
-                    .events_sdb
-                    .delete(&mut wtxn, scope_ref, event_id_bytes)?;
+            let akc_key_bytes = index::make_akc_index_key(
+                event_val.pubkey.as_bytes(),
+                event_val.kind.as_u16(),
+                &event_val.created_at,
+                event_val.id.as_bytes(),
+            );
+            self.db
+                .akc_index_sdb
+                .delete(&mut wtxn, scope_ref, &akc_key_bytes)?;
 
-                let ci_key_bytes =
-                    index::make_ci_index_key(&event_val.created_at, event_val.id.as_bytes());
-                db_clone
-                    .ci_index_sdb
-                    .delete(&mut wtxn, scope_ref, &ci_key_bytes)?;
+            let ac_key_bytes = index::make_ac_index_key(
+                event_val.pubkey.as_bytes(),
+                &event_val.created_at,
+                event_val.id.as_bytes(),
+            );
+            self.db
+                .ac_index_sdb
+                .delete(&mut wtxn, scope_ref, &ac_key_bytes)?;
 
-                let akc_key_bytes = index::make_akc_index_key(
-                    event_val.pubkey.as_bytes(),
-                    event_val.kind.as_u16(),
-                    &event_val.created_at,
-                    event_val.id.as_bytes(),
-                );
-                db_clone
-                    .akc_index_sdb
-                    .delete(&mut wtxn, scope_ref, &akc_key_bytes)?;
+            for tag in event_val.tags.iter() {
+                if let (Some(tag_name), Some(tag_value)) =
+                    (tag.single_letter_tag(), tag.content())
+                {
+                    let atc_index_key: Vec<u8> = index::make_atc_index_key(
+                        event_val.pubkey.as_bytes(),
+                        &tag_name,
+                        tag_value,
+                        &event_val.created_at,
+                        event_val.id.as_bytes(),
+                    );
+                    self.db
+                        .atc_index_sdb
+                        .delete(&mut wtxn, scope_ref, &atc_index_key)?;
 
-                let ac_key_bytes = index::make_ac_index_key(
-                    event_val.pubkey.as_bytes(),
-                    &event_val.created_at,
-                    event_val.id.as_bytes(),
-                );
-                db_clone
-                    .ac_index_sdb
-                    .delete(&mut wtxn, scope_ref, &ac_key_bytes)?;
+                    let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
+                        event_val.kind.as_u16(),
+                        &tag_name,
+                        tag_value,
+                        &event_val.created_at,
+                        event_val.id.as_bytes(),
+                    );
+                    self.db
+                        .ktc_index_sdb
+                        .delete(&mut wtxn, scope_ref, &ktc_index_key)?;
 
-                for tag in event_val.tags.iter() {
-                    if let (Some(tag_name), Some(tag_value)) =
-                        (tag.single_letter_tag(), tag.content())
-                    {
-                        let atc_index_key: Vec<u8> = index::make_atc_index_key(
-                            event_val.pubkey.as_bytes(),
-                            &tag_name,
-                            tag_value,
-                            &event_val.created_at,
-                            event_val.id.as_bytes(),
-                        );
-                        db_clone
-                            .atc_index_sdb
-                            .delete(&mut wtxn, scope_ref, &atc_index_key)?;
-
-                        let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
-                            event_val.kind.as_u16(),
-                            &tag_name,
-                            tag_value,
-                            &event_val.created_at,
-                            event_val.id.as_bytes(),
-                        );
-                        db_clone
-                            .ktc_index_sdb
-                            .delete(&mut wtxn, scope_ref, &ktc_index_key)?;
-
-                        let tc_index_key: Vec<u8> = index::make_tc_index_key(
-                            &tag_name,
-                            tag_value,
-                            &event_val.created_at,
-                            event_val.id.as_bytes(),
-                        );
-                        db_clone
-                            .tc_index_sdb
-                            .delete(&mut wtxn, scope_ref, &tc_index_key)?;
-                    }
+                    let tc_index_key: Vec<u8> = index::make_tc_index_key(
+                        &tag_name,
+                        tag_value,
+                        &event_val.created_at,
+                        event_val.id.as_bytes(),
+                    );
+                    self.db
+                        .tc_index_sdb
+                        .delete(&mut wtxn, scope_ref, &tc_index_key)?;
                 }
             }
-            wtxn.commit()?;
-            Result::<(), Error>::Ok(())
-        })
-        .await?
+        }
+        
+        wtxn.commit()?;
+        Ok(())
     }
 }
 
@@ -1093,18 +1087,6 @@ pub(crate) struct Lmdb {
 }
 
 impl Lmdb {
-    /// Convert Option<&str> to Scope for backward compatibility
-    #[inline]
-    pub(crate) fn to_scope(scope_opt: Option<&str>) -> Result<Scope, Error> {
-        match scope_opt {
-            Some(name) if !name.is_empty() => {
-                Scope::named(name).map_err(|e| Error::Other(format!("Invalid scope name: {}", e)))
-            }
-            Some(_) => Err(Error::EmptyScope),
-            None => Ok(Scope::Default),
-        }
-    }
-
     pub(crate) fn create_registry(&self) -> Result<Option<Arc<GlobalScopeRegistry>>, Error> {
         let mut wtxn = self.env.write_txn()?;
         let registry = Arc::new(GlobalScopeRegistry::new(&self.env, &mut wtxn)?);
@@ -1141,18 +1123,24 @@ impl Lmdb {
             Ok(None)
         }
     }
-
-    pub(crate) fn new<P>(path: P) -> Result<Self, Error>
+    pub(crate) fn with_config<P>(path: P, config: LmdbConfig) -> Result<Self, Error>
     where
         P: AsRef<Path>,
     {
-        let env: Env = unsafe {
-            EnvOpenOptions::new()
-                .flags(EnvFlags::NO_TLS)
-                .max_dbs(18 + 1)
-                .map_size(MAP_SIZE)
-                .open(path)?
-        };
+        let mut env_builder = EnvOpenOptions::new();
+        env_builder
+            .max_dbs(config.max_dbs)
+            .map_size(config.map_size)
+            .max_readers(config.max_readers);
+        
+        // Apply flags if any
+        if !config.flags.is_empty() {
+            unsafe {
+                env_builder.flags(config.flags);
+            }
+        }
+        
+        let env = unsafe { env_builder.open(path)? };
 
         let mut txn = env.write_txn()?;
 
@@ -1162,7 +1150,6 @@ impl Lmdb {
         let events_sdb = scoped_database_options(&env, registry.clone())
             .raw_bytes()
             .name("events")
-            .unnamed_for_default()
             .create(&mut txn)?;
 
         let ci_index_sdb = scoped_database_options(&env, registry.clone())
@@ -1222,13 +1209,13 @@ impl Lmdb {
     }
 
     #[inline]
-    pub(crate) fn read_txn(&self) -> Result<RoTxn, Error> {
-        Ok(self.env.read_txn()?)
+    pub(crate) fn read_txn(&self) -> Result<RoTxn<'_, WithTls>, Error> {
+        self.env.read_txn().map_err(Error::from)
     }
 
     #[inline]
-    pub(crate) fn write_txn(&self) -> Result<RwTxn, Error> {
-        Ok(self.env.write_txn()?)
+    pub(crate) fn write_txn(&self) -> Result<heed::RwTxn<'_>, Error> {
+        self.env.write_txn().map_err(Error::from)
     }
 
     pub(crate) fn store_in_scope(
@@ -1241,7 +1228,6 @@ impl Lmdb {
         let id: &[u8] = event.id.as_bytes();
 
         self.events_sdb.put(txn, scope, id, event.encode(fbb))?;
-
         let ci_index_key: Vec<u8> =
             index::make_ci_index_key(&event.created_at, event.id.as_bytes());
         self.ci_index_sdb.put(txn, scope, &ci_index_key, id)?;
@@ -1294,69 +1280,6 @@ impl Lmdb {
         Ok(())
     }
 
-    pub(crate) fn remove(&self, txn: &mut RwTxn, event_borrow: &EventBorrow) -> Result<(), Error> {
-        let default_scope = &Scope::Default;
-        self.events_sdb
-            .delete(txn, default_scope, event_borrow.id)?;
-
-        let ci_index_key: Vec<u8> =
-            index::make_ci_index_key(&event_borrow.created_at, event_borrow.id);
-        self.ci_index_sdb
-            .delete(txn, default_scope, &ci_index_key)?;
-
-        let akc_index_key: Vec<u8> = index::make_akc_index_key(
-            event_borrow.pubkey,
-            event_borrow.kind,
-            &event_borrow.created_at,
-            event_borrow.id,
-        );
-        self.akc_index_sdb
-            .delete(txn, default_scope, &akc_index_key)?;
-
-        let ac_index_key: Vec<u8> = index::make_ac_index_key(
-            event_borrow.pubkey,
-            &event_borrow.created_at,
-            event_borrow.id,
-        );
-        self.ac_index_sdb
-            .delete(txn, default_scope, &ac_index_key)?;
-
-        for cow_tag in event_borrow.tags.iter() {
-            if let Some((tag_name, tag_value)) = cow_tag.extract() {
-                let atc_index_key: Vec<u8> = index::make_atc_index_key(
-                    event_borrow.pubkey,
-                    &tag_name,
-                    tag_value,
-                    &event_borrow.created_at,
-                    event_borrow.id,
-                );
-                self.atc_index_sdb
-                    .delete(txn, default_scope, &atc_index_key)?;
-
-                let ktc_index_key: Vec<u8> = index::make_ktc_index_key(
-                    event_borrow.kind,
-                    &tag_name,
-                    tag_value,
-                    &event_borrow.created_at,
-                    event_borrow.id,
-                );
-                self.ktc_index_sdb
-                    .delete(txn, default_scope, &ktc_index_key)?;
-
-                let tc_index_key: Vec<u8> = index::make_tc_index_key(
-                    &tag_name,
-                    tag_value,
-                    &event_borrow.created_at,
-                    event_borrow.id,
-                );
-                self.tc_index_sdb
-                    .delete(txn, default_scope, &tc_index_key)?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn wipe(&self, txn: &mut RwTxn) -> Result<(), Error> {
         let default_scope = &Scope::Default;
         self.events_sdb.clear(txn, default_scope)?;
@@ -1400,18 +1323,33 @@ impl Lmdb {
         }
     }
 
-    pub fn delete(&self, read_txn: &RoTxn, txn: &mut RwTxn, filter: Filter) -> Result<(), Error> {
-        let events_iter = self.query(read_txn, &Scope::Default, filter)?;
-        for event_result in events_iter {
-            let event_borrow = event_result?;
-            self.remove(txn, &event_borrow)?;
+    pub fn delete_in_scope(
+        &self,
+        txn: &mut RwTxn,
+        scope: &Scope,
+        filter: Filter,
+    ) -> Result<(), Error> {
+        // Collect event IDs first to avoid borrowing issues
+        let events_to_delete: Vec<EventId> = {
+            let events_iter = self.query(txn, scope, filter)?;
+            let mut ids = Vec::new();
+            for event_result in events_iter {
+                let event_borrow = event_result?;
+                ids.push(EventId::from_slice(event_borrow.id)?);
+            }
+            ids
+        };
+        
+        // Now delete the collected events
+        for event_id in events_to_delete {
+            self.remove_event_in_scope(txn, scope, &event_id)?;
         }
         Ok(())
     }
 
     pub fn query<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         filter: Filter,
     ) -> Result<Box<dyn Iterator<Item = Result<EventBorrow<'txn>, Error>> + 'txn>, Error> {
@@ -1666,7 +1604,7 @@ impl Lmdb {
 
     pub fn find_replaceable_event_in_txn<'txn>(
         &self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         author: &PublicKey,
         kind: Kind,
@@ -1697,7 +1635,7 @@ impl Lmdb {
 
     pub fn find_addressable_event_in_txn<'txn>(
         &self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         coordinate: &Coordinate,
     ) -> Result<Option<EventBorrow<'txn>>, Error> {
@@ -1751,6 +1689,7 @@ impl Lmdb {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mark_coordinate_deleted(
         &self,
         txn: &mut RwTxn,
@@ -1766,7 +1705,7 @@ impl Lmdb {
 
     pub(crate) fn when_is_coordinate_deleted<'txn>(
         &self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         coordinate: &CoordinateBorrow<'txn>,
     ) -> Result<Option<Timestamp>, Error> {
@@ -1779,7 +1718,7 @@ impl Lmdb {
 
     pub(crate) fn ci_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         since: &Timestamp,
         until: &Timestamp,
@@ -1799,7 +1738,7 @@ impl Lmdb {
 
     pub(crate) fn tc_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         tag_name: &SingleLetterTag,
         tag_value: &str,
@@ -1822,7 +1761,7 @@ impl Lmdb {
 
     pub(crate) fn ac_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         author: &[u8; 32],
         since: Timestamp,
@@ -1842,7 +1781,7 @@ impl Lmdb {
 
     pub(crate) fn akc_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         author: &[u8; 32],
         kind: u16,
@@ -1869,7 +1808,7 @@ impl Lmdb {
 
     pub(crate) fn atc_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         author: &[u8; 32],
         tag_name: &SingleLetterTag,
@@ -1899,7 +1838,7 @@ impl Lmdb {
 
     pub(crate) fn ktc_iter_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         kind: u16,
         tag_name: &SingleLetterTag,
@@ -1929,7 +1868,7 @@ impl Lmdb {
 
     pub(crate) fn find_events_by_coordinate_scoped<'txn>(
         &'txn self,
-        txn: &'txn RoTxn<'txn>,
+        txn: &'txn RoTxn,
         scope: &Scope,
         coordinate: &Coordinate,
         before_or_at: Timestamp,
@@ -2058,5 +1997,186 @@ impl Lmdb {
             self.tc_index_sdb.delete(txn, scope, &tc_index_key)?;
         }
         Ok(true)
+    }
+
+    // Transaction-aware methods for batched operations
+
+    pub(crate) fn save_event_with_txn(
+        &self,
+        txn: &mut RwTxn,
+        scope: &Scope,
+        fbb: &mut FlatBufferBuilder,
+        event: &Event,
+    ) -> Result<SaveEventStatus, Error> {
+        // Check if event is ephemeral
+        if event.kind.is_ephemeral() {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Ephemeral));
+        }
+
+        // Check if event already exists
+        if self.has_event_in_scope(txn, scope, event.id.as_bytes())? {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Duplicate));
+        }
+
+        // Check if event ID was deleted
+        if self.is_deleted(txn, scope, &event.id)? {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
+        }
+
+        // Check if coordinate was deleted after event's created_at date
+        if let Some(coordinate) = event.coordinate() {
+            if let Some(time) = self.when_is_coordinate_deleted(txn, scope, &coordinate)? {
+                if event.created_at <= time {
+                    return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
+                }
+            }
+        }
+
+        // Handle deletion events
+        if event.kind == Kind::EventDeletion {
+            let mut _has_valid_deletion = false;
+            let mut has_invalid_deletion = false;
+
+            for tag in event.tags.iter() {
+                if let Some(tag_standard) = tag.as_standardized() {
+                    match tag_standard {
+                        TagStandard::Event {
+                            event_id: event_id_to_delete,
+                            ..
+                        } => {
+                            if let Some(target_event) =
+                                self.get_event_by_id_in_txn(txn, scope, event_id_to_delete)?
+                            {
+                                if target_event.pubkey == event.pubkey.as_bytes() {
+                                    self.remove_event_in_scope(txn, scope, event_id_to_delete)?;
+                                    self.mark_deleted(txn, scope, event_id_to_delete)?;
+                                    _has_valid_deletion = true;
+                                } else {
+                                    // Attempting to delete someone else's event - invalid
+                                    has_invalid_deletion = true;
+                                }
+                            }
+                        }
+                        TagStandard::Coordinate {
+                            coordinate: coord_to_delete,
+                            ..
+                        } => {
+                            if coord_to_delete.public_key == event.pubkey {
+                                // Find all events matching the coordinate to delete them
+                                let events_to_remove_borrows = self
+                                    .find_events_by_coordinate_scoped(
+                                        txn,
+                                        scope,
+                                        coord_to_delete,
+                                        Timestamp::max(),
+                                    )?;
+
+                                // Collect EventIds to release borrows before mutable operations
+                                let event_ids_to_delete: Vec<EventId> = events_to_remove_borrows
+                                    .iter()
+                                    .map(|eb| EventId::from_slice(eb.id))
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|_| {
+                                        Error::Other(
+                                            "Invalid event ID slice during coordinate deletion"
+                                                .to_string(),
+                                        )
+                                    })?;
+
+                                drop(events_to_remove_borrows);
+
+                                for id_val in event_ids_to_delete {
+                                    self.remove_event_in_scope(txn, scope, &id_val)?;
+                                    self.mark_deleted(txn, scope, &id_val)?;
+                                }
+                                _has_valid_deletion = true;
+                            } else {
+                                // Attempting to delete someone else's coordinate - invalid
+                                has_invalid_deletion = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // If there were any invalid deletion attempts, reject the entire event
+            if has_invalid_deletion {
+                return Ok(SaveEventStatus::Rejected(RejectedReason::InvalidDelete));
+            }
+        }
+
+        // Handle replaceable events
+        if event.kind.is_replaceable() {
+            if let Some(existing_event_borrow) =
+                self.find_replaceable_event_in_txn(txn, scope, &event.pubkey, event.kind)?
+            {
+                if event.created_at < existing_event_borrow.created_at
+                    || (event.created_at == existing_event_borrow.created_at
+                        && event.id.as_bytes() < existing_event_borrow.id)
+                {
+                    return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
+                }
+                // Remove the existing event
+                let id_to_remove = EventId::from_slice(existing_event_borrow.id).map_err(|_| {
+                    Error::Other("Invalid event ID for replaceable event".to_string())
+                })?;
+                self.remove_event_in_scope(txn, scope, &id_to_remove)?;
+            }
+        }
+
+        // Handle addressable events
+        if event.kind.is_addressable() {
+            if let Some(identifier) = event.tags.identifier() {
+                let coordinate =
+                    Coordinate::new(event.kind, event.pubkey).identifier(identifier.to_string());
+
+                if let Some(existing_event_borrow) =
+                    self.find_addressable_event_in_txn(txn, scope, &coordinate)?
+                {
+                    if event.created_at < existing_event_borrow.created_at
+                        || (event.created_at == existing_event_borrow.created_at
+                            && event.id.as_bytes() < existing_event_borrow.id)
+                    {
+                        return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
+                    }
+                    // Remove the existing event
+                    let id_to_remove =
+                        EventId::from_slice(existing_event_borrow.id).map_err(|_| {
+                            Error::Other("Invalid event ID for addressable event".to_string())
+                        })?;
+                    self.remove_event_in_scope(txn, scope, &id_to_remove)?;
+                }
+            }
+        }
+
+        // Store the event and its indexes
+        self.store_in_scope(txn, scope, fbb, event)?;
+
+        Ok(SaveEventStatus::Success)
+    }
+
+    pub(crate) fn delete_by_id_with_txn(
+        &self,
+        txn: &mut RwTxn,
+        scope: &Scope,
+        event_id: &EventId,
+    ) -> Result<bool, Error> {
+        self.remove_event_in_scope(txn, scope, event_id)
+    }
+
+    pub(crate) fn query_with_txn<'txn>(
+        &'txn self,
+        txn: &'txn RoTxn,
+        scope: &Scope,
+        filter: Filter,
+    ) -> Result<Vec<Event>, Error> {
+        let iter = self.query(txn, scope, filter)?;
+        let mut events = Vec::new();
+        for event_result in iter {
+            let event_borrow = event_result?;
+            events.push(event_borrow.into_owned());
+        }
+        Ok(events)
     }
 }
