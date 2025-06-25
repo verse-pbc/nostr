@@ -20,15 +20,26 @@ mod transaction;
 mod types;
 
 pub use self::error::Error;
-use self::ingester::{Ingester, IngesterItem};
+use self::ingester::{Ingester, IngesterHandle, IngesterItem};
 use self::lmdb::Lmdb;
 pub use self::lmdb::LmdbConfig;
 pub use self::transaction::{ReadTransaction, WriteTransaction};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Store {
     db: Lmdb,
     ingester: Sender<IngesterItem>,
+    ingester_handle: Option<IngesterHandle>,
+}
+
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            ingester: self.ingester.clone(),
+            ingester_handle: None, // Cannot clone oneshot::Sender, shutdown only available on original
+        }
+    }
 }
 
 impl Store {
@@ -43,9 +54,20 @@ impl Store {
         fs::create_dir_all(path)?;
 
         let db: Lmdb = Lmdb::with_config(path, config)?;
-        let ingester: Sender<IngesterItem> = Ingester::run(db.clone());
+        let (ingester, ingester_handle) = Ingester::run(db.clone());
 
-        Ok(Self { db, ingester })
+        Ok(Self { 
+            db, 
+            ingester, 
+            ingester_handle: Some(ingester_handle),
+        })
+    }
+
+    /// Shutdown the ingester gracefully
+    pub fn shutdown(&mut self) {
+        if let Some(handle) = self.ingester_handle.take() {
+            handle.shutdown();
+        }
     }
 
     /// Create a GlobalScopeRegistry for this store

@@ -184,17 +184,17 @@ impl NostrLMDB {
     {
         Self::open_with_config(path, LmdbConfig::from_env())
     }
-    
+
     /// Create a new write transaction
     pub fn write_transaction(&self) -> Result<WriteTransaction<'_>, DatabaseError> {
         self.db.write_transaction().map_err(DatabaseError::backend)
     }
-    
+
     /// Create a new read transaction
     pub fn read_transaction(&self) -> Result<ReadTransaction<'_>, DatabaseError> {
         self.db.read_transaction().map_err(DatabaseError::backend)
     }
-    
+
     /// Save an event within a transaction
     pub fn save_event_with_txn(
         &self,
@@ -202,10 +202,11 @@ impl NostrLMDB {
         scope: &Scope,
         event: &NostrEvent,
     ) -> Result<SaveEventStatus, DatabaseError> {
-        self.db.save_event_with_txn(txn, scope, event)
+        self.db
+            .save_event_with_txn(txn, scope, event)
             .map_err(DatabaseError::backend)
     }
-    
+
     /// Delete events matching a filter within a transaction
     pub fn delete_with_txn(
         &self,
@@ -213,8 +214,16 @@ impl NostrLMDB {
         scope: &Scope,
         filter: NostrFilter,
     ) -> Result<usize, DatabaseError> {
-        self.db.delete_with_txn(txn, scope, filter)
+        self.db
+            .delete_with_txn(txn, scope, filter)
             .map_err(DatabaseError::backend)
+    }
+}
+
+impl Drop for NostrLMDB {
+    fn drop(&mut self) {
+        // Shutdown the ingester when NostrLMDB is dropped
+        self.db.shutdown();
     }
 }
 
@@ -518,7 +527,6 @@ impl NostrLMDB {
         // Direct LMDB access - no spawn_blocking needed for reads
         self.db.has_event(event_id).map_err(DatabaseError::backend)
     }
-
 }
 
 impl ScopedView<'_> {
@@ -625,7 +633,6 @@ impl ScopedView<'_> {
             .delete_by_id_with_txn(txn, &self.scope, event_id)
             .map_err(DatabaseError::backend)
     }
-
 }
 
 #[cfg(test)]

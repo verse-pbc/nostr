@@ -109,6 +109,20 @@ impl IngesterItem {
 pub(super) struct Ingester {
     db: Lmdb,
     rx: Receiver<IngesterItem>,
+    shutdown_rx: oneshot::Receiver<()>,
+}
+
+/// Handle for shutting down the ingester
+#[derive(Debug)]
+pub(super) struct IngesterHandle {
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+impl IngesterHandle {
+    /// Signal the ingester to shutdown gracefully
+    pub(super) fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+    }
 }
 
 impl Ingester {
@@ -132,16 +146,19 @@ impl Ingester {
     }
 
     /// Build and spawn a new ingester
-    pub(super) fn run(db: Lmdb) -> Sender<IngesterItem> {
+    pub(super) fn run(db: Lmdb) -> (Sender<IngesterItem>, IngesterHandle) {
         // Create new flume channel (unbounded for maximum performance)
         let (tx, rx) = flume::unbounded();
+        
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // Construct and spawn ingester
-        let ingester = Self { db, rx };
+        let ingester = Self { db, rx, shutdown_rx };
         ingester.spawn_ingester();
 
-        // Return ingester sender
-        tx
+        // Return ingester sender and shutdown handle
+        (tx, IngesterHandle { shutdown_tx })
     }
 
     fn spawn_ingester(self) {
@@ -150,14 +167,35 @@ impl Ingester {
         });
     }
     
-    fn run_ingester_loop(self) {
+    fn run_ingester_loop(mut self) {
         #[cfg(debug_assertions)]
         tracing::debug!("Ingester thread started with commit batching");
 
         let mut fbb = FlatBufferBuilder::with_capacity(70_000);
         
-        // Process events as they arrive
-        while let Ok(first_item) = self.rx.recv() {
+        // Process events as they arrive, checking for shutdown
+        loop {
+            // Check for shutdown signal first
+            if let Ok(()) = self.shutdown_rx.try_recv() {
+                #[cfg(debug_assertions)]
+                tracing::debug!("Ingester received shutdown signal, exiting");
+                break;
+            }
+            
+            // Try to receive the next item with a timeout to allow shutdown checking
+            let first_item = match self.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(item) => item,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    // Timeout - continue loop to check shutdown signal again
+                    continue;
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    // Channel disconnected - normal shutdown
+                    #[cfg(debug_assertions)]
+                    tracing::debug!("Ingester channel disconnected, exiting");
+                    break;
+                }
+            };
             let mut batch = vec![first_item];
             // Drain all currently available items
             batch.extend(self.rx.drain());
