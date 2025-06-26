@@ -9,4 +9,7 @@ many-events.json
 many-events.json.zst
 .idea/
 .vscode/
-env/CLAUDE.md
+env/
+.repomix-*.txt
+vibe-tools.config.json
+.cursor/rules/

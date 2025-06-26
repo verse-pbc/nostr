@@ -1,6 +1,6 @@
 [package]
 name = "nostr-sdk"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2021"
 description = "High level Nostr client library."
 authors.workspace = true
@@ -75,6 +75,9 @@ name = "fetch-events"
 [[example]]
 name = "gossip"
 required-features = ["all-nips"]
+
+[[example]]
+name = "monitor"
 
 [[example]]
 name = "nostr-connect"

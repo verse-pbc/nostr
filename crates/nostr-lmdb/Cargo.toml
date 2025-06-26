@@ -1,6 +1,6 @@
 [package]
 name = "nostr-lmdb"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2021"
 description = "LMDB storage backend for nostr apps"
 authors = { workspace = true }
@@ -33,5 +33,5 @@ heed = { version = "0.22", default-features = false, features = ["posix-sem"] }
 [dev-dependencies]
 futures = "0.3"
 nostr-sdk = { workspace = true }
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
