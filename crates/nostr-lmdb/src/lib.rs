@@ -220,13 +220,6 @@ impl NostrLMDB {
     }
 }
 
-impl Drop for NostrLMDB {
-    fn drop(&mut self) {
-        // Shutdown the ingester when NostrLMDB is dropped
-        self.db.shutdown();
-    }
-}
-
 impl NostrDatabase for NostrLMDB {
     #[inline]
     fn backend(&self) -> Backend {

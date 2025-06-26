@@ -20,7 +20,7 @@ mod transaction;
 mod types;
 
 pub use self::error::Error;
-use self::ingester::{Ingester, IngesterHandle, IngesterItem};
+use self::ingester::{Ingester, IngesterItem};
 use self::lmdb::Lmdb;
 pub use self::lmdb::LmdbConfig;
 pub use self::transaction::{ReadTransaction, WriteTransaction};
@@ -29,7 +29,6 @@ pub use self::transaction::{ReadTransaction, WriteTransaction};
 pub struct Store {
     db: Lmdb,
     ingester: Sender<IngesterItem>,
-    ingester_handle: Option<IngesterHandle>,
 }
 
 impl Clone for Store {
@@ -37,13 +36,11 @@ impl Clone for Store {
         Self {
             db: self.db.clone(),
             ingester: self.ingester.clone(),
-            ingester_handle: None, // Cannot clone oneshot::Sender, shutdown only available on original
         }
     }
 }
 
 impl Store {
-    
     pub fn open_with_config<P>(path: P, config: LmdbConfig) -> Result<Store, Error>
     where
         P: AsRef<Path>,
@@ -54,20 +51,9 @@ impl Store {
         fs::create_dir_all(path)?;
 
         let db: Lmdb = Lmdb::with_config(path, config)?;
-        let (ingester, ingester_handle) = Ingester::run(db.clone());
+        let ingester = Ingester::run(db.clone());
 
-        Ok(Self { 
-            db, 
-            ingester, 
-            ingester_handle: Some(ingester_handle),
-        })
-    }
-
-    /// Shutdown the ingester gracefully
-    pub fn shutdown(&mut self) {
-        if let Some(handle) = self.ingester_handle.take() {
-            handle.shutdown();
-        }
+        Ok(Self { db, ingester })
     }
 
     /// Create a GlobalScopeRegistry for this store
@@ -98,7 +84,6 @@ impl Store {
             self.db.get_registry_scopes(new_registry.as_ref())
         }
     }
-
 
     /// Store an event.
     pub async fn save_event(&self, event: &Event) -> Result<SaveEventStatus, Error> {
@@ -181,7 +166,7 @@ impl Store {
         let mut txn = self.db.write_txn()?;
         self.db.wipe(&mut txn)?;
         txn.commit()?;
-        
+
         Ok(())
     }
 
@@ -235,15 +220,15 @@ impl Store {
             }
             Scope::Default => self.db.unscoped(),
         };
-        
+
         // Perform the query directly
         let result = internal_sv.query(filter)?;
-        
+
         // Yield to runtime if we processed many items
         if result.len() > 100 {
             tokio::task::yield_now().await;
         }
-        
+
         Ok(result)
     }
 
@@ -262,7 +247,7 @@ impl Store {
             }
             Scope::Default => self.db.unscoped(),
         };
-        
+
         // Perform the lookup directly
         internal_sv.event_by_id(&event_id)
     }
@@ -278,15 +263,15 @@ impl Store {
             }
             Scope::Default => self.db.unscoped(),
         };
-        
+
         // Perform the count directly
         let count = internal_sv.count(filter)?;
-        
+
         // Yield to runtime if the count operation was potentially heavy
         if count > 1000 {
             tokio::task::yield_now().await;
         }
-        
+
         Ok(count)
     }
 

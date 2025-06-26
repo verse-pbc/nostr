@@ -11,7 +11,7 @@
 //!
 //! The ingester automatically batches ALL available events in the channel. This provides:
 //! - Optimal write performance without manual batching
-//! - Reduced LMDB transaction overhead  
+//! - Reduced LMDB transaction overhead
 //! - Transparent to the caller - just use `save_event()` as normal
 //! - No artificial limits - processes all available events in a single transaction
 //!
@@ -49,7 +49,6 @@ enum OperationResult {
     Save(Result<SaveEventStatus, Error>),
     Delete(Result<(), Error>),
 }
-
 
 pub(super) enum IngesterOperation {
     SaveEvent {
@@ -109,20 +108,6 @@ impl IngesterItem {
 pub(super) struct Ingester {
     db: Lmdb,
     rx: Receiver<IngesterItem>,
-    shutdown_rx: oneshot::Receiver<()>,
-}
-
-/// Handle for shutting down the ingester
-#[derive(Debug)]
-pub(super) struct IngesterHandle {
-    shutdown_tx: oneshot::Sender<()>,
-}
-
-impl IngesterHandle {
-    /// Signal the ingester to shutdown gracefully
-    pub(super) fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
-    }
 }
 
 impl Ingester {
@@ -139,26 +124,25 @@ impl Ingester {
                 OperationResult::Save(result)
             }
             IngesterOperation::Delete { filter, .. } => {
-                let result = self.db.delete_in_scope(txn, scope, filter.clone()).map(|_| ());
+                let result = self
+                    .db
+                    .delete_in_scope(txn, scope, filter.clone())
+                    .map(|_| ());
                 OperationResult::Delete(result)
             }
         }
     }
 
     /// Build and spawn a new ingester
-    pub(super) fn run(db: Lmdb) -> (Sender<IngesterItem>, IngesterHandle) {
+    pub(super) fn run(db: Lmdb) -> Sender<IngesterItem> {
         // Create new flume channel (unbounded for maximum performance)
         let (tx, rx) = flume::unbounded();
-        
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // Construct and spawn ingester
-        let ingester = Self { db, rx, shutdown_rx };
+        let ingester = Self { db, rx };
         ingester.spawn_ingester();
 
-        // Return ingester sender and shutdown handle
-        (tx, IngesterHandle { shutdown_tx })
+        tx
     }
 
     fn spawn_ingester(self) {
@@ -166,87 +150,70 @@ impl Ingester {
             self.run_ingester_loop();
         });
     }
-    
-    fn run_ingester_loop(mut self) {
+
+    fn run_ingester_loop(self) {
         #[cfg(debug_assertions)]
         tracing::debug!("Ingester thread started with commit batching");
 
         let mut fbb = FlatBufferBuilder::with_capacity(70_000);
-        
-        // Process events as they arrive, checking for shutdown
+
         loop {
-            // Check for shutdown signal first
-            if let Ok(()) = self.shutdown_rx.try_recv() {
-                #[cfg(debug_assertions)]
-                tracing::debug!("Ingester received shutdown signal, exiting");
-                break;
-            }
-            
-            // Try to receive the next item with a timeout to allow shutdown checking
-            let first_item = match self.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            let first_item = match self.rx.recv() {
                 Ok(item) => item,
-                Err(flume::RecvTimeoutError::Timeout) => {
-                    // Timeout - continue loop to check shutdown signal again
-                    continue;
-                }
-                Err(flume::RecvTimeoutError::Disconnected) => {
-                    // Channel disconnected - normal shutdown
+                Err(flume::RecvError::Disconnected) => {
                     #[cfg(debug_assertions)]
                     tracing::debug!("Ingester channel disconnected, exiting");
                     break;
                 }
             };
             let mut batch = vec![first_item];
-            // Drain all currently available items
             batch.extend(self.rx.drain());
-            
+
             #[cfg(debug_assertions)]
             let batch_count = batch.len();
-            
-            // Process the batch in a transaction
+
             let results = self.process_batch_in_transaction(batch, &mut fbb);
-            
+
             #[cfg(debug_assertions)]
             tracing::debug!("Processed batch of {} operations", batch_count);
-            
-            // Send results back to callers
+
             self.send_batch_results(results);
         }
 
         #[cfg(debug_assertions)]
         tracing::debug!("Ingester thread exited");
     }
-    
+
     fn process_batch_in_transaction(
         &self,
         batch: Vec<IngesterItem>,
         fbb: &mut FlatBufferBuilder,
     ) -> Vec<(IngesterItem, OperationResult)> {
-        // Group by scope for transaction efficiency
-        let mut by_scope: std::collections::HashMap<Scope, Vec<IngesterItem>> = std::collections::HashMap::new();
+        let mut by_scope: std::collections::HashMap<Scope, Vec<IngesterItem>> =
+            std::collections::HashMap::new();
         for item in batch {
             by_scope.entry(item.scope.clone()).or_default().push(item);
         }
-        
+
         let mut all_results = Vec::new();
-        
-        // Process each scope in its own transaction
+
         for (scope, items) in by_scope {
             match self.db.write_txn() {
                 Ok(mut txn) => {
                     let mut results = Vec::new();
                     let mut has_error = false;
-                    
-                    // Process all items for this scope
+
                     for item in items {
                         let result = self.process_operation(&mut txn, &scope, &item.operation, fbb);
-                        if matches!(&result, OperationResult::Save(Err(_)) | OperationResult::Delete(Err(_))) {
+                        if matches!(
+                            &result,
+                            OperationResult::Save(Err(_)) | OperationResult::Delete(Err(_))
+                        ) {
                             has_error = true;
                         }
                         results.push((item, result));
                     }
-                    
-                    // Commit or abort based on errors
+
                     if has_error {
                         txn.abort();
                         tracing::warn!("Transaction aborted due to errors for scope: {:?}", scope);
@@ -254,7 +221,10 @@ impl Ingester {
                         match txn.commit() {
                             Ok(()) => {
                                 #[cfg(debug_assertions)]
-                                tracing::debug!("Transaction committed successfully for scope: {:?}", scope);
+                                tracing::debug!(
+                                    "Transaction committed successfully for scope: {:?}",
+                                    scope
+                                );
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "Failed to commit transaction");
@@ -269,7 +239,7 @@ impl Ingester {
                             }
                         }
                     }
-                    
+
                     all_results.extend(results);
                 }
                 Err(e) => {
@@ -277,18 +247,22 @@ impl Ingester {
                     // Send error for all items in this scope
                     for item in items {
                         let error_result = match &item.operation {
-                            IngesterOperation::SaveEvent { .. } => OperationResult::Save(Err(e.clone())),
-                            IngesterOperation::Delete { .. } => OperationResult::Delete(Err(e.clone())),
+                            IngesterOperation::SaveEvent { .. } => {
+                                OperationResult::Save(Err(e.clone()))
+                            }
+                            IngesterOperation::Delete { .. } => {
+                                OperationResult::Delete(Err(e.clone()))
+                            }
                         };
                         all_results.push((item, error_result));
                     }
                 }
             }
         }
-        
+
         all_results
     }
-    
+
     fn send_batch_results(&self, results: Vec<(IngesterItem, OperationResult)>) {
         for (item, result) in results {
             match (item.operation, result) {
