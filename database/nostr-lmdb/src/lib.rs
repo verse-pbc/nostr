@@ -7,18 +7,131 @@
 //! A Nostr database implementation using LMDB.
 //!
 //! Fork of [Pocket](https://github.com/mikedilger/pocket) database.
+//!
+//! ## Scoped Database Access
+//!
+//! NostrLMDB supports scoped database access, which allows multiple tenants to store and retrieve
+//! data in isolation within a single LMDB database file. Each scope has its own isolated data space,
+//! and operations in one scope do not affect data in another scope or the global (unscoped) space.
+//!
+//! ### The ScopedView Pattern
+//!
+//! NostrLMDB implements a ScopedView pattern that provides isolated database views for different tenants:
+//!
+//! - Each logical table uses `scoped_heed::ScopedBytesDatabase` internally
+//! - Scopes are implemented as prefixes to database keys
+//! - Nostr-specific codecs handle serialization/deserialization within scoped contexts
+//!
+//! ### Basic Usage
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use nostr::{EventBuilder, Filter, Keys, Kind};
+//! use nostr_database::NostrDatabase;
+//! use nostr_lmdb::NostrLMDB;
+//! use scoped_heed::Scope;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let db = Arc::new(NostrLMDB::open("./db")?);
+//!
+//! // Save an event in the "tenant_a" scope
+//! let scope = Scope::named("tenant_a")?;
+//! let tenant_a = db.scoped(&scope)?;
+//! tenant_a.save_event(&event).await?;
+//!
+//! // Query events in the "tenant_a" scope
+//! let filter = Filter::new();
+//! let events = tenant_a.query(filter.clone()).await?;
+//!
+//! // Access unscoped (legacy) data
+//! let legacy_events = db.query(filter).await?; // Direct call for unscoped
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Scope Isolation
+//!
+//! Data in different scopes is completely isolated. Operations in one scope do not affect data in
+//! another scope or the global (unscoped) space.
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use nostr_lmdb::NostrLMDB;
+//! # use nostr::{EventBuilder, Filter, Keys, Kind};
+//! # use nostr_database::NostrDatabase;
+//! # use scoped_heed::Scope;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let db = Arc::new(NostrLMDB::open("./db")?);
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let filter = Filter::new();
+//! // These operations are completely isolated
+//! let scope_a = Scope::named("tenant_a")?;
+//! let scope_b = Scope::named("tenant_b")?;
+//! db.scoped(&scope_a)?.save_event(&event).await?;
+//! db.scoped(&scope_b)?.save_event(&event).await?;
+//!
+//! let tenant_a_events = db.scoped(&scope_a)?.query(filter.clone()).await?;
+//! let tenant_b_events = db.scoped(&scope_b)?.query(filter.clone()).await?;
+//! let global_events = db.query(filter).await?; // Direct call for unscoped
+//!
+//! // Each query only sees events in its own scope
+//! assert_eq!(tenant_a_events.len(), 1);
+//! assert_eq!(tenant_b_events.len(), 1);
+//! assert_eq!(global_events.len(), 0);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Implementation Details
+//!
+//! The scoped database functionality is implemented using:
+//!
+//! - `scoped_heed::ScopedBytesDatabase` for each logical table
+//! - Custom Nostr codecs that work with the scoped database
+//! - The `scoped()` method to create a new scoped view
+//!
+//! ### Backward Compatibility
+//!
+//! The existing NostrLMDB API continues to work with unscoped data. All existing code will
+//! continue to function without modification, operating on the global (unscoped) data space.
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use nostr_lmdb::NostrLMDB;
+//! # use nostr::{EventBuilder, Filter, Keys, Kind};
+//! # use nostr_database::NostrDatabase;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let db = Arc::new(NostrLMDB::open("./db")?);
+//! # let keys = Keys::generate();
+//! # let event = EventBuilder::new(Kind::TextNote, "test").sign_with_keys(&keys)?;
+//! let filter = Filter::new();
+//! // API for unscoped data
+//! db.save_event(&event).await?;
+//! let events = db.query(filter.clone()).await?;
+//! // This is now the standard way to interact with unscoped data.
+//! # Ok(())
+//! # }
+//! ```
 
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 #![allow(unknown_lints)]
+#![allow(clippy::mutable_key_type)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+pub use nostr::nips::nip01::{Coordinate, CoordinateBorrow};
 use nostr::prelude::*;
 use nostr::util::BoxedFuture;
 use nostr_database::{
     Backend, DatabaseError, DatabaseEventStatus, Events, NostrDatabase, SaveEventStatus,
 };
+pub use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod store;
 
@@ -31,6 +144,142 @@ const MAP_SIZE: usize = 1024 * 1024 * 1024 * 32; // 32GB
 // 32-bit
 #[cfg(target_pointer_width = "32")]
 const MAP_SIZE: usize = 0xFFFFF000; // 4GB (2^32-4096)
+
+/// A view into a specific scope of the Nostr LMDB database.
+///
+/// This struct is created by the `scoped` or `unscoped` methods on `NostrLMDB`.
+/// It encapsulates an Arc reference to the main database (`db`) and a scope.
+/// If scope is `Scope::Named`, operations are performed within that named scope.
+/// If scope is `Scope::Default`, operations are performed in the global/unscoped context.
+#[derive(Debug, Clone)]
+pub struct ScopedView {
+    db: Arc<NostrLMDB>,
+    scope: Scope,
+}
+
+impl ScopedView {
+    /// Returns the name of the scope, if this view is scoped.
+    /// Returns `None` if this is an unscoped (global) view.
+    pub fn scope_name(&self) -> Option<&str> {
+        self.scope.name()
+    }
+}
+
+impl NostrDatabase for ScopedView {
+    #[inline]
+    fn backend(&self) -> Backend {
+        Backend::LMDB
+    }
+
+    fn save_event<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> BoxedFuture<'a, Result<SaveEventStatus, DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .save_event_in_scope(&self.scope, event)
+                .await
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn check_id<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> BoxedFuture<'a, Result<DatabaseEventStatus, DatabaseError>> {
+        Box::pin(async move {
+            if self
+                .db
+                .db
+                .has_event_in_scope(&self.scope, event_id)
+                .map_err(DatabaseError::backend)?
+            {
+                if self
+                    .db
+                    .db
+                    .event_is_deleted_in_scope(&self.scope, event_id)
+                    .map_err(DatabaseError::backend)?
+                {
+                    Ok(DatabaseEventStatus::Deleted)
+                } else {
+                    Ok(DatabaseEventStatus::Saved)
+                }
+            } else {
+                Ok(DatabaseEventStatus::NotExistent)
+            }
+        })
+    }
+
+    fn event_by_id<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> BoxedFuture<'a, Result<Option<Event>, DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .event_by_id_in_scope(&self.scope, *event_id)
+                .await
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn count(&self, filter: Filter) -> BoxedFuture<Result<usize, DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .count_in_scope(&self.scope, filter)
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn query(&self, filter: Filter) -> BoxedFuture<Result<Events, DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .query_in_scope(&self.scope, filter)
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn negentropy_items(
+        &self,
+        filter: Filter,
+    ) -> BoxedFuture<Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .negentropy_items_in_scope(&self.scope, filter)
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn delete(&self, filter: Filter) -> BoxedFuture<Result<(), DatabaseError>> {
+        Box::pin(async move {
+            self.db
+                .db
+                .delete_in_scope(&self.scope, filter)
+                .await
+                .map_err(DatabaseError::backend)
+        })
+    }
+
+    fn wipe(&self) -> BoxedFuture<Result<(), DatabaseError>> {
+        Box::pin(async move {
+            // For scoped view, wipe only the specific scope
+            if let Scope::Named { .. } = &self.scope {
+                self.db
+                    .db
+                    .wipe_scope(&self.scope)
+                    .map_err(DatabaseError::backend)?;
+            } else {
+                // For default scope, delegate to the main database wipe
+                self.db.db.wipe().map_err(DatabaseError::backend)?;
+            }
+            Ok(())
+        })
+    }
+}
 
 /// Nostr LMDB database builder
 #[derive(Debug, Clone)]
@@ -85,14 +334,15 @@ impl NostrLmdbBuilder {
     pub fn build(self) -> Result<NostrLMDB, DatabaseError> {
         let map_size: usize = self.map_size.unwrap_or(MAP_SIZE);
         // LMDB defaults: max_readers=126, max_dbs=0
-        // We use 126 readers (LMDB default) and 20 dbs (reasonable for our use case)
+        // We use 126 readers (LMDB default) and 25 dbs (9 ScopedBytesDatabase × 2 + 1 registry)
         let max_readers: u32 = self.max_readers.unwrap_or(126);
-        let max_dbs: u32 = self.max_dbs.unwrap_or(10);
+        let max_dbs: u32 = self.max_dbs.unwrap_or(19);
 
         let db: Store = Store::open(self.path, map_size, max_readers, max_dbs)
             .map_err(DatabaseError::backend)?;
+        let registry = db.create_registry().map_err(DatabaseError::backend)?;
 
-        Ok(NostrLMDB { db })
+        Ok(NostrLMDB { db, registry })
     }
 }
 
@@ -100,6 +350,7 @@ impl NostrLmdbBuilder {
 #[derive(Debug)]
 pub struct NostrLMDB {
     db: Store,
+    registry: Option<Arc<GlobalScopeRegistry>>,
 }
 
 impl NostrLMDB {
@@ -119,6 +370,51 @@ impl NostrLMDB {
         P: AsRef<Path>,
     {
         NostrLmdbBuilder::new(path)
+    }
+
+    /// Create a scoped view for database operations using a Scope object
+    ///
+    /// - Pass a `Scope::Named` struct with a non-empty name for named scope
+    /// - Pass `Scope::Default` for unscoped (global) operations
+    ///
+    /// This method requires using the Scope enum directly.
+    pub fn scoped(self: &Arc<Self>, scope: &Scope) -> Result<ScopedView, DatabaseError> {
+        // Register the scope in the registry if available and it's a named scope
+        if let Scope::Named { .. } = scope {
+            if let Some(registry) = &self.registry {
+                // Register the scope in the registry - this is critical for proper scope management
+                self.db
+                    .register_scope(registry, scope)
+                    .map_err(DatabaseError::backend)?;
+            }
+        }
+
+        let view = ScopedView {
+            db: Arc::clone(self),
+            scope: scope.clone(),
+        };
+        Ok(view)
+    }
+
+    /// Create a view for the default (unscoped) database
+    pub fn unscoped(self: &Arc<Self>) -> ScopedView {
+        ScopedView {
+            db: Arc::clone(self),
+            scope: Scope::Default,
+        }
+    }
+
+    /// List all registered scopes in the database
+    pub fn list_scopes(&self) -> Result<Vec<Scope>, DatabaseError> {
+        // Pass the singleton registry to the get_registry_scopes method
+        match self
+            .db
+            .get_registry_scopes(self.registry.as_ref())
+            .map_err(DatabaseError::backend)?
+        {
+            Some(scopes) => Ok(scopes),
+            None => Ok(vec![Scope::Default]),
+        }
     }
 }
 

@@ -65,10 +65,12 @@ pub(super) enum IngesterOperation {
     SaveEvent {
         event: Event,
         tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
+        scope: scoped_heed::Scope,
     },
     Delete {
         filter: Filter,
         tx: Option<oneshot::Sender<Result<(), Error>>>,
+        scope: scoped_heed::Scope,
     },
 }
 
@@ -94,8 +96,9 @@ pub(super) struct IngesterItem {
 
 impl IngesterItem {
     #[must_use]
-    pub(super) fn save_event_with_feedback(
+    pub(super) fn save_event_with_feedback_scoped(
         event: &Event,
+        scope: scoped_heed::Scope,
     ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
         let (tx, rx) = oneshot::channel();
         (
@@ -103,6 +106,7 @@ impl IngesterItem {
                 operation: IngesterOperation::SaveEvent {
                     event: event.clone(),
                     tx: Some(tx),
+                    scope,
                 },
             },
             rx,
@@ -110,8 +114,9 @@ impl IngesterItem {
     }
 
     #[must_use]
-    pub(super) fn delete_with_feedback(
+    pub(super) fn delete_with_feedback_scoped(
         filter: Filter,
+        scope: scoped_heed::Scope,
     ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
         let (tx, rx) = oneshot::channel();
         (
@@ -119,6 +124,7 @@ impl IngesterItem {
                 operation: IngesterOperation::Delete {
                     filter,
                     tx: Some(tx),
+                    scope,
                 },
             },
             rx,
@@ -141,12 +147,17 @@ impl Ingester {
         fbb: &mut FlatBufferBuilder,
     ) -> OperationResult {
         match item.operation {
-            IngesterOperation::SaveEvent { event, tx } => {
-                let result = self.db.save_event_with_txn(read_txn, txn, fbb, &event);
+            IngesterOperation::SaveEvent { event, tx, scope } => {
+                let result = self
+                    .db
+                    .save_event_with_txn_scoped(read_txn, txn, fbb, &scope, &event);
                 OperationResult::Save { result, tx }
             }
-            IngesterOperation::Delete { filter, tx } => {
-                let result = self.db.delete_with_txn(read_txn, txn, filter).map(|_| ()); // Convert Result<usize, Error> to Result<(), Error>
+            IngesterOperation::Delete { filter, tx, scope } => {
+                let result = self
+                    .db
+                    .delete_with_txn_scoped(read_txn, txn, &scope, filter)
+                    .map(|_| ()); // Convert Result<usize, Error> to Result<(), Error>
                 OperationResult::Delete { result, tx }
             }
         }
@@ -217,7 +228,9 @@ impl Ingester {
                 tracing::error!(error = %e, "Failed to create read transaction");
                 // Send BatchTransactionFailed for all items
                 for item in batch {
-                    let error_result = item.operation.into_error_result(Error::BatchTransactionFailed);
+                    let error_result = item
+                        .operation
+                        .into_error_result(Error::BatchTransactionFailed);
                     results.push(error_result);
                 }
                 return;
@@ -231,7 +244,9 @@ impl Ingester {
                 tracing::error!(error = %e, "Failed to create write transaction");
                 // Send BatchTransactionFailed for all items
                 for item in batch {
-                    let error_result = item.operation.into_error_result(Error::BatchTransactionFailed);
+                    let error_result = item
+                        .operation
+                        .into_error_result(Error::BatchTransactionFailed);
                     results.push(error_result);
                 }
                 return;
@@ -263,7 +278,7 @@ impl Ingester {
             if abort_on_error {
                 // The operation that caused the error keeps its original error (already in result)
                 results.push(result);
-                
+
                 // All previously processed operations get BatchFailed error
                 for prev_result in results.iter_mut().take(index) {
                     match prev_result {
@@ -275,7 +290,7 @@ impl Ingester {
                         }
                     }
                 }
-                
+
                 // All remaining operations get BatchFailed error
                 for item in batch_iter {
                     let error_result = item
@@ -283,15 +298,15 @@ impl Ingester {
                         .into_error_result(Error::BatchTransactionFailed);
                     results.push(error_result);
                 }
-                
+
                 // Abort the write transaction first, then drop read transaction
                 write_txn.abort();
                 drop(read_txn);
                 tracing::warn!("Transaction aborted due to errors");
-                
+
                 return;
             }
-            
+
             results.push(result);
         }
 
@@ -309,7 +324,9 @@ impl Ingester {
                 // Convert all results to BatchTransactionFailed
                 for result in results.iter_mut() {
                     match result {
-                        OperationResult::Save { result: res, .. } => *res = Err(Error::BatchTransactionFailed),
+                        OperationResult::Save { result: res, .. } => {
+                            *res = Err(Error::BatchTransactionFailed)
+                        }
                         OperationResult::Delete { result: res, .. } => {
                             *res = Err(Error::BatchTransactionFailed)
                         }
@@ -327,6 +344,7 @@ mod tests {
 
     use futures::future::join_all;
     use nostr::{EventBuilder, Keys, Kind};
+    use scoped_heed::Scope;
     use tempfile::TempDir;
 
     use super::*;
@@ -334,7 +352,7 @@ mod tests {
 
     async fn setup_test_store() -> (Arc<Store>, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let store = Store::open(temp_dir.path(), 1024 * 1024 * 10, 10, 10)
+        let store = Store::open(temp_dir.path(), 1024 * 1024 * 10, 10, 50)
             .expect("Failed to open test store");
         (Arc::new(store), temp_dir)
     }
@@ -396,7 +414,13 @@ mod tests {
 
                 store
                     .db
-                    .save_event_with_txn(&read_txn, &mut txn, &mut fbb, &event)
+                    .save_event_with_txn_scoped(
+                        &read_txn,
+                        &mut txn,
+                        &mut fbb,
+                        &Scope::Default,
+                        &event,
+                    )
                     .expect("Failed to save event");
 
                 txn.commit().expect("Failed to commit transaction");
@@ -483,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingester_channel_disconnect() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let db = Lmdb::new(temp_dir.path(), 1024 * 1024, 10, 10).expect("Failed to create Lmdb");
+        let db = Lmdb::new(temp_dir.path(), 1024 * 1024, 10, 50).expect("Failed to create Lmdb");
 
         // Create ingester
         let sender = Ingester::run(db);

@@ -17,6 +17,7 @@ flatbuffers = "23.5.26"
 flume = "0.11"
 nostr = { workspace = true, features = ["std"] }
 nostr-database = { workspace = true, features = ["flatbuf"] }
+scoped-heed = "0.2.0-alpha.9"
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
@@ -30,5 +31,5 @@ heed = { version = "0.20", default-features = false, features = ["read-txn-no-tl
 [dev-dependencies]
 futures = "0.3"
 nostr-sdk = { workspace = true }
-tempfile.workspace = true
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

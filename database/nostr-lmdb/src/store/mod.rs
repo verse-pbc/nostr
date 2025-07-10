@@ -5,10 +5,12 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use flume::Sender;
 use nostr_database::prelude::*;
 use nostr_database::SaveEventStatus;
+use scoped_heed::{GlobalScopeRegistry, Scope};
 
 mod error;
 mod ingester;
@@ -57,7 +59,15 @@ impl Store {
 
     /// Store an event.
     pub async fn save_event(&self, event: &Event) -> Result<SaveEventStatus, Error> {
-        let (item, rx) = IngesterItem::save_event_with_feedback(event);
+        self.save_event_in_scope(&Scope::Default, event).await
+    }
+
+    pub async fn save_event_in_scope(
+        &self,
+        scope: &Scope,
+        event: &Event,
+    ) -> Result<SaveEventStatus, Error> {
+        let (item, rx) = IngesterItem::save_event_with_feedback_scoped(event, scope.clone());
 
         // Send to the ingester
         self.ingester.send(item).map_err(|_| Error::MpscSend)?;
@@ -68,10 +78,19 @@ impl Store {
 
     /// Get an event by ID
     pub fn get_event_by_id(&self, id: &EventId) -> Result<Option<Event>, Error> {
+        self.get_event_by_id_in_scope(&Scope::Default, id)
+    }
+
+    /// Get an event by ID in a specific scope
+    pub fn get_event_by_id_in_scope(
+        &self,
+        scope: &Scope,
+        id: &EventId,
+    ) -> Result<Option<Event>, Error> {
         let txn = self.db.read_txn()?;
         let result = self
             .db
-            .get_event_by_id(&txn, id.as_bytes())?
+            .get_event_by_id_scoped(&txn, scope, id.as_bytes())?
             .map(|event_borrow| event_borrow.into_owned());
         txn.commit()?;
         Ok(result)
@@ -79,50 +98,83 @@ impl Store {
 
     /// Do we have an event
     pub fn has_event(&self, id: &EventId) -> Result<bool, Error> {
+        self.has_event_in_scope(&Scope::Default, id)
+    }
+
+    /// Do we have an event in a specific scope
+    pub fn has_event_in_scope(&self, scope: &Scope, id: &EventId) -> Result<bool, Error> {
         let txn = self.db.read_txn()?;
-        let has: bool = self.db.has_event(&txn, id.as_bytes())?;
+        let has: bool = self.db.has_event_scoped(&txn, scope, id.as_bytes())?;
         txn.commit()?;
         Ok(has)
     }
 
     /// Is the event deleted
     pub fn event_is_deleted(&self, id: &EventId) -> Result<bool, Error> {
+        self.event_is_deleted_in_scope(&Scope::Default, id)
+    }
+
+    /// Is the event deleted in a specific scope
+    pub fn event_is_deleted_in_scope(&self, scope: &Scope, id: &EventId) -> Result<bool, Error> {
         let txn = self.db.read_txn()?;
-        let deleted: bool = self.db.is_deleted(&txn, id.as_bytes())?;
+        let deleted: bool = self.db.is_deleted_scoped(&txn, scope, id.as_bytes())?;
         txn.commit()?;
         Ok(deleted)
     }
 
     pub fn count(&self, filter: Filter) -> Result<usize, Error> {
+        self.count_in_scope(&Scope::Default, filter)
+    }
+
+    pub fn count_in_scope(&self, scope: &Scope, filter: Filter) -> Result<usize, Error> {
         let txn = self.db.read_txn()?;
-        let iter = self.db.query(&txn, filter)?;
-        let count = iter.count();
+        let count = self.db.query_with_txn_scoped(&txn, scope, filter)?.count();
         txn.commit()?;
         Ok(count)
     }
 
     // Lookup ID: EVENT_ORD_IMPL
     pub fn query(&self, filter: Filter) -> Result<Events, Error> {
+        self.query_in_scope(&Scope::Default, filter)
+    }
+
+    pub fn query_in_scope(&self, scope: &Scope, filter: Filter) -> Result<Events, Error> {
+        let mut events = Events::new(&filter);
         let txn = self.db.read_txn()?;
-        let mut events_wrapper = Events::new(&filter);
-        events_wrapper.extend(self.db.query(&txn, filter)?.map(|e| e.into_owned()));
+        let vec_events: Vec<Event> = self
+            .db
+            .query_with_txn_scoped(&txn, scope, filter)?
+            .map(|e| e.into_owned())
+            .collect();
         txn.commit()?;
-        Ok(events_wrapper)
+        events.extend(vec_events);
+
+        Ok(events)
     }
 
     pub fn negentropy_items(&self, filter: Filter) -> Result<Vec<(EventId, Timestamp)>, Error> {
-        let txn = self.db.read_txn()?;
-        let items = self
-            .db
-            .query(&txn, filter)?
-            .map(|e| (EventId::from_slice(e.id).unwrap(), e.created_at))
-            .collect();
-        txn.commit()?;
-        Ok(items)
+        self.negentropy_items_in_scope(&Scope::Default, filter)
+    }
+
+    /// Get negentropy items in a specific scope
+    pub fn negentropy_items_in_scope(
+        &self,
+        scope: &Scope,
+        filter: Filter,
+    ) -> Result<Vec<(EventId, Timestamp)>, Error> {
+        let events = self.query_in_scope(scope, filter)?;
+        Ok(events
+            .into_iter()
+            .map(|e: Event| (e.id, e.created_at))
+            .collect())
     }
 
     pub async fn delete(&self, filter: Filter) -> Result<(), Error> {
-        let (item, rx) = IngesterItem::delete_with_feedback(filter);
+        self.delete_in_scope(&Scope::Default, filter).await
+    }
+
+    pub async fn delete_in_scope(&self, scope: &Scope, filter: Filter) -> Result<(), Error> {
+        let (item, rx) = IngesterItem::delete_with_feedback_scoped(filter, scope.clone());
 
         // Send to the ingester
         self.ingester.send(item).map_err(|_| Error::MpscSend)?;
@@ -132,10 +184,53 @@ impl Store {
     }
 
     pub fn wipe(&self) -> Result<(), Error> {
+        self.wipe_scope(&Scope::Default)
+    }
+
+    /// Wipe a specific scope
+    pub fn wipe_scope(&self, scope: &Scope) -> Result<(), Error> {
         let mut txn = self.db.write_txn()?;
-        self.db.wipe(&mut txn)?;
+        self.db.wipe_scope(&mut txn, scope)?;
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Create a GlobalScopeRegistry for this store
+    pub fn create_registry(&self) -> Result<Option<Arc<GlobalScopeRegistry>>, Error> {
+        self.db.create_registry()
+    }
+
+    /// Register a scope in the registry
+    pub fn register_scope(
+        &self,
+        registry: &Arc<GlobalScopeRegistry>,
+        scope: &Scope,
+    ) -> Result<(), Error> {
+        self.db.register_scope(registry, scope)
+    }
+
+    /// Get all scopes from the registry
+    pub fn get_registry_scopes(
+        &self,
+        registry: Option<&Arc<GlobalScopeRegistry>>,
+    ) -> Result<Option<Vec<Scope>>, Error> {
+        if let Some(reg) = registry {
+            // Use the provided registry
+            self.db.get_registry_scopes(Some(reg))
+        } else {
+            // Create a new registry if none provided (backward compatibility)
+            let new_registry = self.db.create_registry()?;
+            self.db.get_registry_scopes(new_registry.as_ref())
+        }
+    }
+
+    pub async fn event_by_id_in_scope(
+        &self,
+        scope: &Scope,
+        event_id: EventId,
+    ) -> Result<Option<Event>, Error> {
+        // Use the synchronous method for direct LMDB access
+        self.get_event_by_id_in_scope(scope, &event_id)
     }
 }
