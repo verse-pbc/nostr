@@ -10,10 +10,12 @@ use std::path::Path;
 
 use heed::byteorder::NativeEndian;
 use heed::types::{Bytes, Unit, U64};
-use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoRange, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoRange, RoTxn, RwTxn, WithTls};
+use nostr::event::tag::TagStandard;
+use nostr::nips::nip01::{Coordinate, CoordinateBorrow};
 use nostr::prelude::*;
 use nostr_database::flatbuffers::FlatBufferDecodeBorrowed;
-use nostr_database::{FlatBufferBuilder, FlatBufferEncode};
+use nostr_database::{FlatBufferBuilder, FlatBufferEncode, RejectedReason, SaveEventStatus};
 
 mod index;
 
@@ -48,7 +50,12 @@ pub(crate) struct Lmdb {
 }
 
 impl Lmdb {
-    pub(super) fn new<P>(path: P, map_size: usize) -> Result<Self, Error>
+    pub(super) fn new<P>(
+        path: P,
+        map_size: usize,
+        max_readers: u32,
+        max_dbs: u32,
+    ) -> Result<Self, Error>
     where
         P: AsRef<Path>,
     {
@@ -56,7 +63,8 @@ impl Lmdb {
         let env: Env = unsafe {
             EnvOpenOptions::new()
                 .flags(EnvFlags::NO_TLS)
-                .max_dbs(9)
+                .max_dbs(max_dbs)
+                .max_readers(max_readers)
                 .map_size(map_size)
                 .open(path)?
         };
@@ -131,7 +139,7 @@ impl Lmdb {
     ///
     /// This should never block the current thread
     #[inline]
-    pub(crate) fn read_txn(&self) -> Result<RoTxn, Error> {
+    pub(crate) fn read_txn(&self) -> Result<RoTxn<WithTls>, Error> {
         Ok(self.env.read_txn()?)
     }
 
@@ -484,6 +492,14 @@ impl Lmdb {
                 let (_key, value) = result?;
                 let event = self.get_event_by_id(txn, value)?.ok_or(Error::NotFound)?;
 
+                // Skip deleted events
+                let event_id = EventId::from_slice(event.id).map_err(|_| {
+                    Error::Other("Invalid event ID slice in SCRAPE query".to_string())
+                })?;
+                if self.is_deleted(txn, &event_id)? {
+                    continue;
+                }
+
                 if filter.match_event(&event) {
                     output.insert(event);
                 }
@@ -516,6 +532,14 @@ impl Lmdb {
 
             if event.created_at < *since {
                 break;
+            }
+
+            // Skip deleted events
+            let event_id = EventId::from_slice(event.id).map_err(|_| {
+                Error::Other("Invalid event ID slice in query".to_string())
+            })?;
+            if self.is_deleted(txn, &event_id)? {
+                continue;
             }
 
             // check against the rest of the filter
@@ -820,5 +844,195 @@ impl Lmdb {
             Bound::Excluded(end_prefix.as_slice()),
         );
         Ok(self.ktc_index.range(txn, &range)?)
+    }
+    
+    // Transaction-aware save method for batched operations
+    pub(crate) fn save_event_with_txn(
+        &self,
+        txn: &mut RwTxn,
+        fbb: &mut FlatBufferBuilder,
+        event: &Event,
+    ) -> Result<SaveEventStatus, Error> {
+        // Check if event is ephemeral
+        if event.kind.is_ephemeral() {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Ephemeral));
+        }
+
+        // Check if event already exists
+        if self.has_event(txn, event.id.as_bytes())? {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Duplicate));
+        }
+
+        // Check if event ID was deleted
+        if self.is_deleted(txn, &event.id)? {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
+        }
+
+        // Check if coordinate was deleted after event's created_at date
+        if let Some(coordinate) = event.coordinate() {
+            let coord_borrow = CoordinateBorrow {
+                kind: &coordinate.kind,
+                public_key: &coordinate.public_key,
+                identifier: coordinate.identifier.as_deref(),
+            };
+            if let Some(time) = self.when_is_coordinate_deleted(txn, &coord_borrow)? {
+                if event.created_at <= time {
+                    return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
+                }
+            }
+        }
+
+        // Handle deletion events
+        if event.kind == Kind::EventDeletion {
+            for tag in event.tags.iter() {
+                if let Some(tag_standard) = tag.as_standardized() {
+                    match tag_standard {
+                        TagStandard::Event {
+                            event_id: event_id_to_delete,
+                            ..
+                        } => {
+                            if let Some(target_event) =
+                                self.get_event_by_id(txn, event_id_to_delete.as_bytes())?
+                            {
+                                if target_event.pubkey == event.pubkey.as_bytes() {
+                                    // Only mark as deleted, don't remove from database
+                                    self.mark_deleted(txn, event_id_to_delete)?;
+                                } else {
+                                    // Only allow deletion of own events
+                                    return Ok(SaveEventStatus::Rejected(RejectedReason::InvalidDelete));
+                                }
+                            }
+                        }
+                        TagStandard::Coordinate {
+                            coordinate: coord_to_delete,
+                            ..
+                        } => {
+                            // Only allow deletion of own coordinates
+                            if coord_to_delete.public_key != event.pubkey {
+                                return Ok(SaveEventStatus::Rejected(RejectedReason::InvalidDelete));
+                            }
+                            
+                            // Addressable events must have a non-empty identifier
+                            if coord_to_delete.kind.is_addressable() && coord_to_delete.identifier.is_empty() {
+                                return Ok(SaveEventStatus::Rejected(RejectedReason::InvalidDelete));
+                            }
+                            
+                            // Mark coordinate as deleted
+                            let coord_borrow = CoordinateBorrow {
+                                kind: &coord_to_delete.kind,
+                                public_key: &coord_to_delete.public_key,
+                                identifier: Some(coord_to_delete.identifier.as_str()),
+                            };
+                            self.mark_coordinate_deleted(txn, &coord_borrow, event.created_at)?;
+                            
+                            // Mark all events matching the coordinate as deleted
+                            let mut event_ids_to_mark = Vec::new();
+                            let iter = self.atc_iter(
+                                txn,
+                                coord_to_delete.public_key.as_bytes(),
+                                &SingleLetterTag::lowercase(Alphabet::D),
+                                &coord_to_delete.identifier,
+                                &Timestamp::min(),
+                                &Timestamp::max(),
+                            )?;
+                            
+                            for result in iter {
+                                let (_key, id) = result?;
+                                let event = self.get_event_by_id(txn, id)?.ok_or(Error::NotFound)?;
+                                
+                                // the atc index doesn't have kind, so we have to compare the kinds
+                                if event.kind == coord_to_delete.kind.as_u16() {
+                                    let event_id = EventId::from_slice(event.id).map_err(|_| {
+                                        Error::Other(
+                                            "Invalid event ID slice during coordinate deletion"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    event_ids_to_mark.push(event_id);
+                                }
+                            }
+                            
+                            // Now mark as deleted
+                            for event_id in event_ids_to_mark {
+                                self.mark_deleted(txn, &event_id)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Handle replaceable events
+        if event.kind.is_replaceable() {
+            if let Some(existing_event) =
+                self.find_replaceable_event(txn, &event.pubkey, event.kind)?
+            {
+                if event.created_at < existing_event.created_at
+                    || (event.created_at == existing_event.created_at
+                        && event.id.as_bytes() < existing_event.id)
+                {
+                    return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
+                }
+                // Remove the existing event as it's being replaced
+                let event_id = EventId::from_slice(existing_event.id).map_err(|_| {
+                    Error::Other("Invalid event ID slice in replaceable event".to_string())
+                })?;
+                drop(existing_event);
+                self.remove_event(txn, &event_id)?;
+            }
+        }
+        
+        // Handle addressable (parameterized replaceable) events
+        if event.kind.is_addressable() {
+            if let Some(coordinate_borrow) = event.coordinate() {
+                // Convert CoordinateBorrow to Coordinate
+                let coordinate = Coordinate {
+                    kind: *coordinate_borrow.kind,
+                    public_key: *coordinate_borrow.public_key,
+                    identifier: coordinate_borrow.identifier.map(|s| s.to_string()).unwrap_or_default(),
+                };
+                if let Some(existing_event) = self.find_addressable_event(txn, &coordinate)? {
+                    if event.created_at < existing_event.created_at
+                        || (event.created_at == existing_event.created_at
+                            && event.id.as_bytes() < existing_event.id)
+                    {
+                        return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
+                    }
+                    // Convert to EventId and drop the borrow before removing
+                    let event_id = EventId::from_slice(existing_event.id).map_err(|_| {
+                        Error::Other("Invalid event ID slice in addressable event".to_string())
+                    })?;
+                    drop(existing_event);
+                    self.remove_event(txn, &event_id)?;
+                }
+            }
+        }
+        
+        // Store the event
+        self.store(txn, fbb, event)?;
+        
+        Ok(SaveEventStatus::Success)
+    }
+    
+    pub(crate) fn remove_event(&self, txn: &mut RwTxn, event_id: &EventId) -> Result<(), Error> {
+        // First get the raw event bytes 
+        let event_bytes = match self.events.get(txn, event_id.as_bytes())? {
+            Some(bytes) => {
+                // Copy the bytes to owned data
+                let owned_bytes: Vec<u8> = bytes.to_vec();
+                Some(owned_bytes)
+            }
+            None => None,
+        };
+        
+        // Now we can work with the owned bytes
+        if let Some(bytes) = event_bytes {
+            // Decode and remove
+            let event_borrow = EventBorrow::decode(&bytes)?;
+            self.remove(txn, &event_borrow)?;
+        }
+        
+        Ok(())
     }
 }

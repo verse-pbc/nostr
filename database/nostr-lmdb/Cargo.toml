@@ -3,28 +3,35 @@ name = "nostr-lmdb"
 version = "0.42.0"
 edition = "2021"
 description = "LMDB storage backend for nostr apps"
-authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-license.workspace = true
+authors = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
 readme = "README.md"
 rust-version = "1.72.0"
 keywords = ["nostr", "database", "lmdb"]
 
 [dependencies]
-async-utility.workspace = true
+async-utility = { workspace = true }
+flatbuffers = "23.5.26"
+flume = "0.11"
 nostr = { workspace = true, features = ["std"] }
 nostr-database = { workspace = true, features = ["flatbuf"] }
 tokio = { workspace = true, features = ["sync"] }
-tracing.workspace = true
+tracing = { workspace = true }
+# TODO: Remove when tinystr is updated to use zerovec with alloc feature
+# This is a workaround for: error[E0432]: unresolved import `zerovec::maps`
+zerovec = { version = "0.11.2", features = ["alloc"] }
 
 [target.'cfg(not(all(target_os = "macos", target_os = "ios")))'.dependencies]
-heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls"] }
+heed = { version = "0.22", default-features = false }
 
 # POSIX semaphores are required for Apple's App Sandbox on iOS & macOS
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-heed = { version = "0.20", default-features = false, features = ["read-txn-no-tls", "posix-sem"] }
+heed = { version = "0.22", default-features = false, features = ["posix-sem"] }
 
 [dev-dependencies]
+futures = "0.3"
+nostr-sdk = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

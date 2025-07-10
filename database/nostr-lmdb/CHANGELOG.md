@@ -25,9 +25,17 @@
 
 ## Unreleased
 
+### Changed
+
+- Upgrade heed from 0.20 to 0.22
+
 ### Added
 
+- Add transaction API with `write_transaction()` and `read_transaction()` methods
+- Add `save_event_with_txn()` and `delete_with_txn()` for atomic operations
+- Add automatic batching in ingester for 30-40x write performance improvement
 - Add NostrLmdbBuilder and allow setting a custom map size (https://github.com/rust-nostr/nostr/pull/970)
+- Add `max_readers()` and `max_dbs()` configuration options to NostrLmdbBuilder
 
 ## v0.42.0 - 2025/05/20
 

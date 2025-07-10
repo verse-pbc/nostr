@@ -6,6 +6,7 @@
 use std::{fmt, io};
 
 use async_utility::tokio::task::JoinError;
+use nostr::event::Error as NostrEventError;
 use nostr::{key, secp256k1};
 use nostr_database::flatbuffers;
 use tokio::sync::oneshot;
@@ -28,6 +29,10 @@ pub enum Error {
     WrongEventKind,
     /// Not found
     NotFound,
+    /// Nostr Event error
+    NostrEvent(NostrEventError),
+    /// Other error
+    Other(String),
 }
 
 impl std::error::Error for Error {}
@@ -45,6 +50,8 @@ impl fmt::Display for Error {
             Self::MpscSend => write!(f, "mpsc channel send error"),
             Self::NotFound => write!(f, "Not found"),
             Self::WrongEventKind => write!(f, "Wrong event kind"),
+            Self::NostrEvent(e) => write!(f, "Nostr event error: {e}"),
+            Self::Other(s) => write!(f, "{s}"),
         }
     }
 }
@@ -88,5 +95,30 @@ impl From<secp256k1::Error> for Error {
 impl From<oneshot::error::RecvError> for Error {
     fn from(e: oneshot::error::RecvError) -> Self {
         Self::OneshotRecv(e)
+    }
+}
+
+impl From<NostrEventError> for Error {
+    fn from(e: NostrEventError) -> Self {
+        Self::NostrEvent(e)
+    }
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Io(e) => Self::Io(io::Error::new(e.kind(), e.to_string())),
+            Self::Heed(_) => Self::Other("LMDB error (cloned)".to_string()),
+            Self::FlatBuffers(_) => Self::Other("FlatBuffers error (cloned)".to_string()),
+            Self::Thread(_) => Self::Other("Thread error (cloned)".to_string()),
+            Self::Key(_) => Self::Other("Key error (cloned)".to_string()),
+            Self::Secp256k1(e) => Self::Secp256k1(*e),
+            Self::OneshotRecv(_) => Self::Other("Oneshot receive error (cloned)".to_string()),
+            Self::MpscSend => Self::MpscSend,
+            Self::WrongEventKind => Self::WrongEventKind,
+            Self::NotFound => Self::NotFound,
+            Self::NostrEvent(_) => Self::Other("Nostr event error (cloned)".to_string()),
+            Self::Other(s) => Self::Other(s.clone()),
+        }
     }
 }
