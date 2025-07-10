@@ -68,10 +68,12 @@ enum IngesterOperation {
     SaveEvent {
         event: Event,
         tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
+        scope: scoped_heed::Scope,
     },
     Delete {
         filter: Filter,
         tx: Option<oneshot::Sender<Result<(), Error>>>,
+        scope: scoped_heed::Scope,
     },
 }
 
@@ -97,28 +99,32 @@ pub(super) struct IngesterItem {
 
 impl IngesterItem {
     #[must_use]
-    pub(super) fn save_event_with_feedback(
-        event: Event,
+    pub(super) fn save_event_with_feedback_scoped(
+        event: &Event,
+        scope: scoped_heed::Scope,
     ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
         let (tx, rx) = oneshot::channel();
-        let item: Self = Self {
+        let item = Self {
             operation: IngesterOperation::SaveEvent {
-                event,
+                event: event.clone(),
                 tx: Some(tx),
+                scope,
             },
         };
         (item, rx)
     }
 
     #[must_use]
-    pub(super) fn delete_with_feedback(
+    pub(super) fn delete_with_feedback_scoped(
         filter: Filter,
+        scope: scoped_heed::Scope,
     ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
         let (tx, rx) = oneshot::channel();
-        let item: Self = Self {
+        let item = Self {
             operation: IngesterOperation::Delete {
                 filter,
                 tx: Some(tx),
+                scope,
             },
         };
         (item, rx)
@@ -248,7 +254,7 @@ impl Ingester {
                     );
                 }
 
-                // Abort the write transaction first, then drop read transaction
+                // Abort the write transaction
                 write_txn.abort();
                 return;
             }
@@ -270,12 +276,12 @@ impl Ingester {
         fbb: &mut FlatBufferBuilder,
     ) -> OperationResult {
         match item.operation {
-            IngesterOperation::SaveEvent { event, tx } => {
-                let result = self.db.save_event_with_txn(txn, fbb, &event);
+            IngesterOperation::SaveEvent { event, tx, scope } => {
+                let result = self.db.save_event_with_txn_scoped(txn, fbb, &scope, &event);
                 OperationResult::Save { result, tx }
             }
-            IngesterOperation::Delete { filter, tx } => {
-                let result = self.db.delete(txn, filter);
+            IngesterOperation::Delete { filter, tx, scope } => {
+                let result = self.db.delete_scoped(txn, &scope, filter);
                 OperationResult::Delete { result, tx }
             }
         }
@@ -303,6 +309,7 @@ mod tests {
 
     use futures::future::join_all;
     use nostr::{EventBuilder, Keys, Kind};
+    use scoped_heed::Scope;
     use tempfile::TempDir;
 
     use super::*;
@@ -368,7 +375,12 @@ mod tests {
 
                 store
                     .db
-                    .save_event_with_txn(&mut txn, &mut fbb, &event)
+                    .save_event_with_txn_scoped(
+                        &mut txn,
+                        &mut fbb,
+                        &Scope::Default,
+                        &event,
+                    )
                     .expect("Failed to save event");
 
                 txn.commit().expect("Failed to commit transaction");

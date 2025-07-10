@@ -8,6 +8,7 @@ use std::{fmt, io};
 use async_utility::tokio::task::JoinError;
 use nostr::{key, secp256k1};
 use nostr_database::flatbuffers;
+use scoped_heed::ScopedDbError;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -30,6 +31,8 @@ pub enum Error {
     NotFound,
     /// Batched transaction failed - sent to operations that didn't cause the error
     BatchTransactionFailed,
+    /// Scoped database error
+    ScopedDb(ScopedDbError),
 }
 
 impl std::error::Error for Error {}
@@ -48,6 +51,7 @@ impl fmt::Display for Error {
             Self::NotFound => write!(f, "Not found"),
             Self::WrongEventKind => write!(f, "Wrong event kind"),
             Self::BatchTransactionFailed => write!(f, "Batched transaction failed"),
+            Self::ScopedDb(e) => write!(f, "Scoped database error: {e}"),
         }
     }
 }
@@ -91,5 +95,11 @@ impl From<secp256k1::Error> for Error {
 impl From<oneshot::error::RecvError> for Error {
     fn from(e: oneshot::error::RecvError) -> Self {
         Self::OneshotRecv(e)
+    }
+}
+
+impl From<ScopedDbError> for Error {
+    fn from(e: ScopedDbError) -> Self {
+        Self::ScopedDb(e)
     }
 }
