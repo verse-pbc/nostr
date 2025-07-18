@@ -210,106 +210,108 @@ impl Ingester {
         fbb: &mut FlatBufferBuilder,
         results: &mut Vec<OperationResult>,
     ) {
-        let mut write_txn = match self.db.write_txn() {
-            Ok(txn) => txn,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create write transaction");
-                // Send error for all items
-                let error = e;
-                for item in batch {
-                    let error_result = item.operation.into_error_result(error.clone());
-                    results.push(error_result);
-                }
-                return;
-            }
-        };
-
+        // Open read transaction first - it's cheaper and doesn't block other readers
         let read_txn = match self.db.read_txn() {
             Ok(txn) => txn,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create read transaction");
-                // Send error for all items
-                let error = e;
+                // Send BatchTransactionFailed for all items
                 for item in batch {
-                    let error_result = item.operation.into_error_result(error.clone());
+                    let error_result = item.operation.into_error_result(Error::BatchTransactionFailed);
                     results.push(error_result);
                 }
                 return;
             }
         };
 
-        let mut abort_error = None;
+        // Open write transaction only after read transaction is ready
+        let mut write_txn = match self.db.write_txn() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create write transaction");
+                // Send BatchTransactionFailed for all items
+                for item in batch {
+                    let error_result = item.operation.into_error_result(Error::BatchTransactionFailed);
+                    results.push(error_result);
+                }
+                return;
+            }
+        };
+
         let mut batch_iter = batch;
 
-        for item in &mut batch_iter {
+        for (index, item) in (&mut batch_iter).enumerate() {
             let result = self.process_operation(&read_txn, &mut write_txn, item, fbb);
 
-            // Only abort on actual database errors, not on rejections
-            abort_error = match &result {
+            // Check if we need to abort on actual database errors (not on rejections)
+            let abort_on_error = match &result {
                 OperationResult::Save { result: Err(e), .. } => {
                     tracing::error!(error = %e, "Failed to save event, aborting batch");
-                    Some(e.clone())
+                    true
                 }
                 OperationResult::Delete { result: Err(e), .. } => {
                     tracing::error!(error = %e, "Failed to delete event, aborting batch");
-                    Some(e.clone())
+                    true
                 }
                 OperationResult::Save {
                     result: Ok(SaveEventStatus::Rejected(_)),
                     ..
-                } => None, // Rejections are expected, don't abort
-                _ => None,
+                } => false, // Rejections are expected, don't abort
+                _ => false,
             };
 
-            results.push(result);
-
-            if abort_error.is_some() {
-                break; // Abort immediately on database error
+            if abort_on_error {
+                // The operation that caused the error keeps its original error (already in result)
+                results.push(result);
+                
+                // All previously processed operations get BatchFailed error
+                for prev_result in results.iter_mut().take(index) {
+                    match prev_result {
+                        OperationResult::Save { result: res, .. } => {
+                            *res = Err(Error::BatchTransactionFailed)
+                        }
+                        OperationResult::Delete { result: res, .. } => {
+                            *res = Err(Error::BatchTransactionFailed)
+                        }
+                    }
+                }
+                
+                // All remaining operations get BatchFailed error
+                for item in batch_iter {
+                    let error_result = item
+                        .operation
+                        .into_error_result(Error::BatchTransactionFailed);
+                    results.push(error_result);
+                }
+                
+                // Abort the write transaction first, then drop read transaction
+                write_txn.abort();
+                drop(read_txn);
+                tracing::warn!("Transaction aborted due to errors");
+                
+                return;
             }
+            
+            results.push(result);
         }
 
-        if abort_error.is_some() {
-            drop(read_txn);
-            write_txn.abort();
-
-            tracing::warn!("Transaction aborted due to errors");
-
-            // Convert all previously processed results to abort error
-            for result in results.iter_mut() {
-                match result {
-                    OperationResult::Save { result: res, .. } => {
-                        *res = Err(abort_error.clone().unwrap())
-                    }
-                    OperationResult::Delete { result: res, .. } => {
-                        *res = Err(abort_error.clone().unwrap())
-                    }
-                }
+        // If we get here, no errors occurred during processing
+        // Commit write transaction first, then drop read transaction
+        match write_txn.commit() {
+            Ok(()) => {
+                drop(read_txn);
+                #[cfg(debug_assertions)]
+                tracing::debug!("Transaction committed successfully");
             }
-
-            // Send abort errors for remaining unprocessed items
-            for item in batch_iter {
-                let error_result = item
-                    .operation
-                    .into_error_result(abort_error.clone().unwrap());
-                results.push(error_result);
-            }
-        } else {
-            drop(read_txn);
-            match write_txn.commit() {
-                Ok(()) => {
-                    #[cfg(debug_assertions)]
-                    tracing::debug!("Transaction committed successfully");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to commit transaction");
-                    // Convert all results to commit error
-                    let error = Error::from(e);
-                    for result in results.iter_mut() {
-                        match result {
-                            OperationResult::Save { result: res, .. } => *res = Err(error.clone()),
-                            OperationResult::Delete { result: res, .. } => {
-                                *res = Err(error.clone())
-                            }
+            Err(e) => {
+                drop(read_txn);
+                tracing::error!(error = %e, "Failed to commit transaction");
+                // Convert all results to BatchTransactionFailed
+                for result in results.iter_mut() {
+                    match result {
+                        OperationResult::Save { result: res, .. } => *res = Err(Error::BatchTransactionFailed),
+                        OperationResult::Delete { result: res, .. } => {
+                            *res = Err(Error::BatchTransactionFailed)
                         }
                     }
                 }

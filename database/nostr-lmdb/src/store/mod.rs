@@ -88,7 +88,7 @@ impl Store {
     /// Is the event deleted
     pub fn event_is_deleted(&self, id: &EventId) -> Result<bool, Error> {
         let txn = self.db.read_txn()?;
-        let deleted: bool = self.db.is_deleted(&txn, id)?;
+        let deleted: bool = self.db.is_deleted(&txn, id.as_bytes())?;
         txn.commit()?;
         Ok(deleted)
     }

@@ -332,10 +332,7 @@ impl Lmdb {
 
                 if let Some(event) = self.get_event_by_id(txn, id)? {
                     // Skip deleted events
-                    let event_id = EventId::from_slice(event.id).map_err(|_| {
-                        Error::Other("Invalid event ID slice in ID query".to_string())
-                    })?;
-                    if self.is_deleted(txn, &event_id)? {
+                    if self.is_deleted(txn, event.id)? {
                         continue;
                     }
 
@@ -368,10 +365,7 @@ impl Lmdb {
                         }
 
                         // Skip deleted events
-                        let event_id = EventId::from_slice(event.id).map_err(|_| {
-                            Error::Other("Invalid event ID slice in author-kind query".to_string())
-                        })?;
-                        if self.is_deleted(txn, &event_id)? {
+                        if self.is_deleted(txn, event.id)? {
                             continue 'per_event;
                         }
 
@@ -501,10 +495,7 @@ impl Lmdb {
                 let event = self.get_event_by_id(txn, value)?.ok_or(Error::NotFound)?;
 
                 // Skip deleted events
-                let event_id = EventId::from_slice(event.id).map_err(|_| {
-                    Error::Other("Invalid event ID slice in SCRAPE query".to_string())
-                })?;
-                if self.is_deleted(txn, &event_id)? {
+                if self.is_deleted(txn, event.id)? {
                     continue;
                 }
 
@@ -543,9 +534,7 @@ impl Lmdb {
             }
 
             // Skip deleted events
-            let event_id = EventId::from_slice(event.id)
-                .map_err(|_| Error::Other("Invalid event ID slice in query".to_string()))?;
-            if self.is_deleted(txn, &event_id)? {
+            if self.is_deleted(txn, event.id)? {
                 continue;
             }
 
@@ -633,12 +622,12 @@ impl Lmdb {
     }
 
     #[inline]
-    pub(crate) fn is_deleted(&self, txn: &RoTxn, event_id: &EventId) -> Result<bool, Error> {
-        Ok(self.deleted_ids.get(txn, event_id.as_bytes())?.is_some())
+    pub(crate) fn is_deleted(&self, txn: &RoTxn, event_id_bytes: &[u8]) -> Result<bool, Error> {
+        Ok(self.deleted_ids.get(txn, event_id_bytes)?.is_some())
     }
 
-    pub(crate) fn mark_deleted(&self, txn: &mut RwTxn, event_id: &EventId) -> Result<(), Error> {
-        self.deleted_ids.put(txn, event_id.as_bytes(), &())?;
+    pub(crate) fn mark_deleted(&self, txn: &mut RwTxn, event_id_bytes: &[u8]) -> Result<(), Error> {
+        self.deleted_ids.put(txn, event_id_bytes, &())?;
         Ok(())
     }
 
@@ -804,7 +793,7 @@ impl Lmdb {
         }
 
         // Check if event ID was deleted
-        if self.is_deleted(read_txn, &event.id)? {
+        if self.is_deleted(read_txn, event.id.as_bytes())? {
             return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
         }
 
@@ -836,7 +825,7 @@ impl Lmdb {
                             {
                                 if target_event.pubkey == event.pubkey.as_bytes() {
                                     // Only mark as deleted, don't remove from database
-                                    self.mark_deleted(txn, event_id_to_delete)?;
+                                    self.mark_deleted(txn, event_id_to_delete.as_bytes())?;
                                 } else {
                                     // Only allow deletion of own events
                                     return Ok(SaveEventStatus::Rejected(
@@ -874,7 +863,6 @@ impl Lmdb {
                             self.mark_coordinate_deleted(txn, &coord_borrow, event.created_at)?;
 
                             // Mark all events matching the coordinate as deleted
-                            let mut event_ids_to_mark = Vec::new();
                             let iter = self.atc_iter(
                                 read_txn,
                                 coord_to_delete.public_key.as_bytes(),
@@ -891,19 +879,8 @@ impl Lmdb {
 
                                 // the atc index doesn't have kind, so we have to compare the kinds
                                 if event.kind == coord_to_delete.kind.as_u16() {
-                                    let event_id = EventId::from_slice(event.id).map_err(|_| {
-                                        Error::Other(
-                                            "Invalid event ID slice during coordinate deletion"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                    event_ids_to_mark.push(event_id);
+                                    self.mark_deleted(txn, event.id)?;
                                 }
-                            }
-
-                            // Now mark as deleted
-                            for event_id in event_ids_to_mark {
-                                self.mark_deleted(txn, &event_id)?;
                             }
                         }
                         _ => {}
@@ -924,11 +901,9 @@ impl Lmdb {
                     return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
                 }
                 // Remove the existing event as it's being replaced
-                let event_id = EventId::from_slice(existing_event.id).map_err(|_| {
-                    Error::Other("Invalid event ID slice in replaceable event".to_string())
-                })?;
+                let event_id_bytes = existing_event.id;
                 drop(existing_event);
-                self.remove_event(txn, &event_id)?;
+                self.remove_event(txn, event_id_bytes)?;
             }
         }
 
@@ -951,12 +926,10 @@ impl Lmdb {
                     {
                         return Ok(SaveEventStatus::Rejected(RejectedReason::Replaced));
                     }
-                    // Convert to EventId and drop the borrow before removing
-                    let event_id = EventId::from_slice(existing_event.id).map_err(|_| {
-                        Error::Other("Invalid event ID slice in addressable event".to_string())
-                    })?;
+                    // Convert to bytes and drop the borrow before removing
+                    let event_id_bytes = existing_event.id;
                     drop(existing_event);
-                    self.remove_event(txn, &event_id)?;
+                    self.remove_event(txn, event_id_bytes)?;
                 }
             }
         }
@@ -967,9 +940,9 @@ impl Lmdb {
         Ok(SaveEventStatus::Success)
     }
 
-    pub(crate) fn remove_event(&self, txn: &mut RwTxn, event_id: &EventId) -> Result<(), Error> {
+    pub(crate) fn remove_event(&self, txn: &mut RwTxn, event_id_bytes: &[u8]) -> Result<(), Error> {
         // First get the raw event bytes
-        let event_bytes = match self.events.get(txn, event_id.as_bytes())? {
+        let event_bytes = match self.events.get(txn, event_id_bytes)? {
             Some(bytes) => {
                 // Copy the bytes to owned data
                 let owned_bytes: Vec<u8> = bytes.to_vec();
@@ -997,14 +970,9 @@ impl Lmdb {
         let events = self.query(read_txn, filter)?;
         let mut count = 0;
 
-        // Collect event IDs first to avoid borrowing issues
-        let event_ids: Vec<EventId> = events
-            .map(|event| EventId::from_slice(event.id).unwrap())
-            .collect();
-
-        // Now delete each event
-        for event_id in event_ids {
-            self.remove_event(txn, &event_id)?;
+        // Delete each event
+        for event in events {
+            self.remove_event(txn, event.id)?;
             count += 1;
         }
 
