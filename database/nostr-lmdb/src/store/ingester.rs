@@ -115,6 +115,22 @@ impl IngesterItem {
     }
 
     #[must_use]
+    pub(super) fn save_event_owned_with_feedback_scoped(
+        event: Event,
+        scope: scoped_heed::Scope,
+    ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
+        let (tx, rx) = oneshot::channel();
+        let item = Self {
+            operation: IngesterOperation::SaveEvent {
+                event,
+                tx: Some(tx),
+                scope,
+            },
+        };
+        (item, rx)
+    }
+
+    #[must_use]
     pub(super) fn delete_with_feedback_scoped(
         filter: Filter,
         scope: scoped_heed::Scope,
@@ -138,21 +154,35 @@ pub(super) struct Ingester {
 }
 
 impl Ingester {
-    /// Build and spawn a new ingester
-    pub(super) fn run(db: Lmdb) -> Sender<IngesterItem> {
+    /// Build and spawn a new ingester with optional thread configuration
+    pub(super) fn run(
+        db: Lmdb,
+        thread_config: Option<Box<dyn FnOnce() + Send>>
+    ) -> Sender<IngesterItem> {
         // Create a new flume channel (unbounded for maximum performance)
         let (tx, rx) = flume::unbounded();
 
         // Construct and spawn ingester
         let ingester: Self = Self { db, rx };
-        ingester.spawn_ingester();
+        ingester.spawn_ingester(thread_config);
 
         tx
     }
 
     #[inline]
-    fn spawn_ingester(self) {
-        thread::spawn(move || self.run_ingester_loop());
+    fn spawn_ingester(self, thread_config: Option<Box<dyn FnOnce() + Send>>) {
+        thread::Builder::new()
+            .name("nostr-lmdb-ingester".into())
+            .spawn(move || {
+                // Apply thread configuration if provided
+                if let Some(config) = thread_config {
+                    config();
+                    tracing::info!("Ingester thread configuration applied");
+                }
+
+                self.run_ingester_loop()
+            })
+            .expect("Failed to spawn ingester thread");
     }
 
     fn run_ingester_loop(self) {

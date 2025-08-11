@@ -38,13 +38,26 @@ impl Store {
     where
         P: AsRef<Path>,
     {
+        Self::open_with_config(path, map_size, max_readers, additional_dbs, None)
+    }
+
+    pub(super) fn open_with_config<P>(
+        path: P,
+        map_size: usize,
+        max_readers: u32,
+        additional_dbs: u32,
+        ingester_thread_config: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Store, Error>
+    where
+        P: AsRef<Path>,
+    {
         let path: &Path = path.as_ref();
 
         // Create the directory if it doesn't exist
         fs::create_dir_all(path)?;
 
         let db: Lmdb = Lmdb::new(path, map_size, max_readers, additional_dbs)?;
-        let ingester: Sender<IngesterItem> = Ingester::run(db.clone());
+        let ingester: Sender<IngesterItem> = Ingester::run(db.clone(), ingester_thread_config);
 
         Ok(Self { db, ingester })
     }
@@ -70,6 +83,22 @@ impl Store {
         event: &Event,
     ) -> Result<SaveEventStatus, Error> {
         let (item, rx) = IngesterItem::save_event_with_feedback_scoped(event, scope.clone());
+        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        rx.await?
+    }
+
+    /// Store an event (owned version that avoids cloning)
+    pub async fn save_event_owned(&self, event: Event) -> Result<SaveEventStatus, Error> {
+        self.save_event_owned_in_scope(Scope::Default, event).await
+    }
+
+    /// Store an event in a specific scope (owned version that avoids cloning)
+    pub async fn save_event_owned_in_scope(
+        &self,
+        scope: Scope,
+        event: Event,
+    ) -> Result<SaveEventStatus, Error> {
+        let (item, rx) = IngesterItem::save_event_owned_with_feedback_scoped(event, scope);
         self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
         rx.await?
     }

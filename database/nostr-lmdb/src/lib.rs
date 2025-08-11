@@ -159,6 +159,16 @@ impl ScopedView {
     pub fn scope_name(&self) -> Option<&str> {
         self.scope.name()
     }
+
+    /// Save an event (owned version that avoids cloning)
+    /// This method takes ownership of the event to avoid an internal clone
+    pub async fn save_event_owned(&self, event: Event) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .db
+            .save_event_owned_in_scope(self.scope.clone(), event)
+            .await
+            .map_err(DatabaseError::backend)
+    }
 }
 
 impl NostrDatabase for ScopedView {
@@ -279,7 +289,6 @@ impl NostrDatabase for ScopedView {
 }
 
 /// Nostr LMDB database builder
-#[derive(Debug, Clone)]
 pub struct NostrLmdbBuilder {
     /// Database path
     pub path: PathBuf,
@@ -297,6 +306,20 @@ pub struct NostrLmdbBuilder {
     ///
     /// Defaults to 0 if not set
     pub additional_dbs: Option<u32>,
+    /// Optional callback to configure the ingester thread
+    ingester_thread_config: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl std::fmt::Debug for NostrLmdbBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NostrLmdbBuilder")
+            .field("path", &self.path)
+            .field("map_size", &self.map_size)
+            .field("max_readers", &self.max_readers)
+            .field("additional_dbs", &self.additional_dbs)
+            .field("ingester_thread_config", &self.ingester_thread_config.is_some())
+            .finish()
+    }
 }
 
 impl NostrLmdbBuilder {
@@ -310,6 +333,7 @@ impl NostrLmdbBuilder {
             map_size: None,
             max_readers: None,
             additional_dbs: None,
+            ingester_thread_config: None,
         }
     }
 
@@ -339,6 +363,16 @@ impl NostrLmdbBuilder {
         self
     }
 
+    /// Set a callback to configure the ingester thread (e.g., CPU affinity)
+    /// This is called at the start of the ingester thread.
+    pub fn with_ingester_thread_config<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.ingester_thread_config = Some(Box::new(f));
+        self
+    }
+
     /// Build
     pub fn build(self) -> Result<NostrLMDB, DatabaseError> {
         let map_size: usize = self.map_size.unwrap_or(MAP_SIZE);
@@ -347,8 +381,14 @@ impl NostrLmdbBuilder {
         let max_readers: u32 = self.max_readers.unwrap_or(126);
         let additional_dbs: u32 = self.additional_dbs.unwrap_or(19);
 
-        let db: Store = Store::open(self.path, map_size, max_readers, additional_dbs)
-            .map_err(DatabaseError::backend)?;
+        let db: Store = Store::open_with_config(
+            self.path,
+            map_size,
+            max_readers,
+            additional_dbs,
+            self.ingester_thread_config,
+        )
+        .map_err(DatabaseError::backend)?;
         let registry = db.create_registry().map_err(DatabaseError::backend)?;
 
         Ok(NostrLMDB { db, registry })
@@ -424,6 +464,28 @@ impl NostrLMDB {
             Some(scopes) => Ok(scopes),
             None => Ok(vec![Scope::Default]),
         }
+    }
+
+    /// Save an event (owned version that avoids cloning)
+    /// This method takes ownership of the event to avoid an internal clone
+    pub async fn save_event_owned(&self, event: Event) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .save_event_owned(event)
+            .await
+            .map_err(DatabaseError::backend)
+    }
+
+    /// Save an event in a specific scope (owned version that avoids cloning)
+    /// This method takes ownership of both the scope and event to avoid internal clones
+    pub async fn save_event_owned_in_scope(
+        &self,
+        scope: Scope,
+        event: Event,
+    ) -> Result<SaveEventStatus, DatabaseError> {
+        self.db
+            .save_event_owned_in_scope(scope, event)
+            .await
+            .map_err(DatabaseError::backend)
     }
 }
 
