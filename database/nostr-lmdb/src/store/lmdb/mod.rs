@@ -10,9 +10,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
-use heed::byteorder::NativeEndian;
-use heed::types::{Bytes, Unit, U64};
-use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoRange, RoTxn, RwTxn};
+use heed::{Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 use nostr::prelude::*;
 use nostr_database::flatbuffers::FlatBufferDecodeBorrowed;
 use nostr_database::{FlatBufferBuilder, FlatBufferEncode, RejectedReason, SaveEventStatus};
@@ -72,43 +70,24 @@ impl QueryFilterPattern {
 pub(crate) struct Lmdb {
     /// LMDB env
     env: Env,
-    /// Events
-    events: Database<Bytes, Bytes>, // Event ID, Event
+    /// Events - uses ScopedBytesDatabase with unnamed_for_default for backward compatibility
+    events: ScopedBytesDatabase,
     /// CreatedAt + ID index
-    ci_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    ci_index: ScopedBytesDatabase,
     /// Tag + CreatedAt + ID index
-    tc_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    tc_index: ScopedBytesDatabase,
     /// Author + CreatedAt + ID index
-    ac_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    ac_index: ScopedBytesDatabase,
     /// Author + Kind + CreatedAt + ID index
-    akc_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    akc_index: ScopedBytesDatabase,
     /// Author + Tag + CreatedAt + ID index
-    atc_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    atc_index: ScopedBytesDatabase,
     /// Kind + Tag + CreatedAt + ID index
-    ktc_index: Database<Bytes, Bytes>, // <Index>, Event ID
+    ktc_index: ScopedBytesDatabase,
     /// Deleted IDs
-    deleted_ids: Database<Bytes, Unit>, // Event ID
+    deleted_ids: ScopedBytesDatabase,
     /// Deleted coordinates
-    deleted_coordinates: Database<Bytes, U64<NativeEndian>>, // Coordinate, UNIX timestamp
-    // Scoped versions of databases for multi-tenant support
-    /// Scoped Events
-    events_scoped: ScopedBytesDatabase,
-    /// Scoped CreatedAt + ID index
-    ci_index_scoped: ScopedBytesDatabase,
-    /// Scoped Tag + CreatedAt + ID index
-    tc_index_scoped: ScopedBytesDatabase,
-    /// Scoped Author + CreatedAt + ID index
-    ac_index_scoped: ScopedBytesDatabase,
-    /// Scoped Author + Kind + CreatedAt + ID index
-    akc_index_scoped: ScopedBytesDatabase,
-    /// Scoped Author + Tag + CreatedAt + ID index
-    atc_index_scoped: ScopedBytesDatabase,
-    /// Scoped Kind + Tag + CreatedAt + ID index
-    ktc_index_scoped: ScopedBytesDatabase,
-    /// Scoped Deleted IDs
-    deleted_ids_scoped: ScopedBytesDatabase,
-    /// Scoped Deleted coordinates
-    deleted_coordinates_scoped: ScopedBytesDatabase,
+    deleted_coordinates: ScopedBytesDatabase,
     /// Global scope registry for multi-tenant support
     scope_registry: Arc<GlobalScopeRegistry>,
 }
@@ -124,14 +103,12 @@ impl Lmdb {
         P: AsRef<Path>,
     {
         // Construct LMDB env
-        // Note: We need additional DBs for scoped versions
-        // Original: 9 DBs (1 unnamed for events, 8 named)
-        // Scoped: Each ScopedBytesDatabase creates 2 internal DBs (default + scoped)
-        // So we need: 9 original + (9 scoped * 2) + 1 registry = 28 DBs
+        // Each ScopedBytesDatabase creates 2 internal DBs (default + scoped)
+        // 9 databases * 2 = 18 DBs + 1 registry = 19 DBs
         let env: Env = unsafe {
             EnvOpenOptions::new()
                 .flags(EnvFlags::NO_TLS)
-                .max_dbs(30 + additional_dbs)
+                .max_dbs(19 + additional_dbs)
                 .max_readers(max_readers)
                 .map_size(map_size)
                 .open(path)?
@@ -140,93 +117,48 @@ impl Lmdb {
         // Acquire write transaction
         let mut txn = env.write_txn()?;
 
-        // Open/Create maps (original non-scoped for backward compatibility)
-        let events = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .create(&mut txn)?;
-        let ci_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("ci")
-            .create(&mut txn)?;
-        let tc_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("tci")
-            .create(&mut txn)?;
-        let ac_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("aci")
-            .create(&mut txn)?;
-        let akc_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("akci")
-            .create(&mut txn)?;
-        let atc_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("atci")
-            .create(&mut txn)?;
-        let ktc_index = env
-            .database_options()
-            .types::<Bytes, Bytes>()
-            .name("ktci")
-            .create(&mut txn)?;
-        let deleted_ids = env
-            .database_options()
-            .types::<Bytes, Unit>()
-            .name("deleted-ids")
-            .create(&mut txn)?;
-        let deleted_coordinates = env
-            .database_options()
-            .types::<Bytes, U64<NativeEndian>>()
-            .name("deleted-coordinates")
-            .create(&mut txn)?;
-
         // Create global scope registry for multi-tenant support
         let scope_registry = Arc::new(GlobalScopeRegistry::new(&env, &mut txn)?);
 
         // Create scoped database wrappers using the builder pattern
         // Note: Using unnamed_for_default() for events to maintain backward compatibility
-        let events_scoped = scoped_database_options(&env, scope_registry.clone())
+        // with existing data stored in the unnamed database
+        let events = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
             .name("events")
             .unnamed_for_default()
             .create(&mut txn)?;
-        let ci_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let ci_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("ci_scoped")
+            .name("ci")
             .create(&mut txn)?;
-        let tc_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let tc_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("tci_scoped")
+            .name("tci")
             .create(&mut txn)?;
-        let ac_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let ac_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("aci_scoped")
+            .name("aci")
             .create(&mut txn)?;
-        let akc_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let akc_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("akci_scoped")
+            .name("akci")
             .create(&mut txn)?;
-        let atc_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let atc_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("atci_scoped")
+            .name("atci")
             .create(&mut txn)?;
-        let ktc_index_scoped = scoped_database_options(&env, scope_registry.clone())
+        let ktc_index = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("ktci_scoped")
+            .name("ktci")
             .create(&mut txn)?;
-        let deleted_ids_scoped = scoped_database_options(&env, scope_registry.clone())
+        let deleted_ids = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("deleted-ids_scoped")
+            .name("deleted-ids")
             .create(&mut txn)?;
-        let deleted_coordinates_scoped = scoped_database_options(&env, scope_registry.clone())
+        let deleted_coordinates = scoped_database_options(&env, scope_registry.clone())
             .raw_bytes()
-            .name("deleted-coordinates_scoped")
+            .name("deleted-coordinates")
             .create(&mut txn)?;
 
         // Commit changes
@@ -243,15 +175,6 @@ impl Lmdb {
             ktc_index,
             deleted_ids,
             deleted_coordinates,
-            events_scoped,
-            ci_index_scoped,
-            tc_index_scoped,
-            ac_index_scoped,
-            akc_index_scoped,
-            atc_index_scoped,
-            ktc_index_scoped,
-            deleted_ids_scoped,
-            deleted_coordinates_scoped,
             scope_registry,
         })
     }
@@ -281,7 +204,7 @@ impl Lmdb {
     ) -> Result<(), Error> {
         // Store event
         self.events
-            .put(txn, event.id.as_bytes(), event.encode(fbb))?;
+            .put(txn, &Scope::Default, event.id.as_bytes(), event.encode(fbb))?;
 
         // Index event
         let event: EventBorrow = EventBorrow::from(event);
@@ -290,14 +213,14 @@ impl Lmdb {
     }
 
     fn index_event(&self, txn: &mut RwTxn, index: EventIndexKeys) -> Result<(), Error> {
-        self.ci_index.put(txn, &index.ci_index, &index.id)?;
-        self.akc_index.put(txn, &index.akc_index, &index.id)?;
-        self.ac_index.put(txn, &index.ac_index, &index.id)?;
+        self.ci_index.put(txn, &Scope::Default, &index.ci_index, &index.id)?;
+        self.akc_index.put(txn, &Scope::Default, &index.akc_index, &index.id)?;
+        self.ac_index.put(txn, &Scope::Default, &index.ac_index, &index.id)?;
 
         for tag in index.tags.into_iter() {
-            self.atc_index.put(txn, &tag.atc_index, &index.id)?;
-            self.ktc_index.put(txn, &tag.ktc_index, &index.id)?;
-            self.tc_index.put(txn, &tag.tc_index, &index.id)?;
+            self.atc_index.put(txn, &Scope::Default, &tag.atc_index, &index.id)?;
+            self.ktc_index.put(txn, &Scope::Default, &tag.ktc_index, &index.id)?;
+            self.tc_index.put(txn, &Scope::Default, &tag.tc_index, &index.id)?;
         }
 
         Ok(())
@@ -321,16 +244,16 @@ impl Lmdb {
     ///
     /// It only performs the mechanical deletion from all indexes.
     fn remove(&self, txn: &mut RwTxn, index: &EventIndexKeys) -> Result<(), Error> {
-        self.events.delete(txn, &index.id)?;
-        self.ci_index.delete(txn, &index.ci_index)?;
-        self.akc_index.delete(txn, &index.akc_index)?;
-        self.ac_index.delete(txn, &index.ac_index)?;
+        self.events.delete(txn, &Scope::Default, &index.id)?;
+        self.ci_index.delete(txn, &Scope::Default, &index.ci_index)?;
+        self.akc_index.delete(txn, &Scope::Default, &index.akc_index)?;
+        self.ac_index.delete(txn, &Scope::Default, &index.ac_index)?;
 
         // Delete tag indexes
         for tag in &index.tags {
-            self.atc_index.delete(txn, &tag.atc_index)?;
-            self.ktc_index.delete(txn, &tag.ktc_index)?;
-            self.tc_index.delete(txn, &tag.tc_index)?;
+            self.atc_index.delete(txn, &Scope::Default, &tag.atc_index)?;
+            self.ktc_index.delete(txn, &Scope::Default, &tag.ktc_index)?;
+            self.tc_index.delete(txn, &Scope::Default, &tag.tc_index)?;
         }
 
         Ok(())
@@ -338,7 +261,7 @@ impl Lmdb {
 
     pub(crate) fn wipe(&self, txn: &mut RwTxn) -> Result<(), Error> {
         // Wipe events
-        self.events.clear(txn)?;
+        self.events.clear(txn, &Scope::Default)?;
 
         // Wipe indexes
         self.wipe_indexes(txn)?;
@@ -347,14 +270,14 @@ impl Lmdb {
     }
 
     fn wipe_indexes(&self, txn: &mut RwTxn) -> Result<(), Error> {
-        self.ci_index.clear(txn)?;
-        self.tc_index.clear(txn)?;
-        self.ac_index.clear(txn)?;
-        self.akc_index.clear(txn)?;
-        self.atc_index.clear(txn)?;
-        self.ktc_index.clear(txn)?;
-        self.deleted_ids.clear(txn)?;
-        self.deleted_coordinates.clear(txn)?;
+        self.ci_index.clear(txn, &Scope::Default)?;
+        self.tc_index.clear(txn, &Scope::Default)?;
+        self.ac_index.clear(txn, &Scope::Default)?;
+        self.akc_index.clear(txn, &Scope::Default)?;
+        self.atc_index.clear(txn, &Scope::Default)?;
+        self.ktc_index.clear(txn, &Scope::Default)?;
+        self.deleted_ids.clear(txn, &Scope::Default)?;
+        self.deleted_coordinates.clear(txn, &Scope::Default)?;
         Ok(())
     }
 
@@ -363,11 +286,9 @@ impl Lmdb {
         self.wipe_indexes(txn)?;
 
         // Collect indexes
-        // TODO: avoid this allocation
-        let size: u64 = self.events.len(txn)?;
-        let mut indexes: Vec<EventIndexKeys> = Vec::with_capacity(size as usize);
+        let mut indexes: Vec<EventIndexKeys> = Vec::new();
 
-        for result in self.events.iter(txn)? {
+        for result in self.events.iter(txn, &Scope::Default)? {
             let (_id, event) = result?;
 
             // Decode event
@@ -467,7 +388,7 @@ impl Lmdb {
         txn: &'a RoTxn,
         event_id: &[u8],
     ) -> Result<Option<EventBorrow<'a>>, Error> {
-        match self.events.get(txn, event_id)? {
+        match self.events.get(txn, &Scope::Default, event_id)? {
             Some(bytes) => Ok(Some(EventBorrow::decode(bytes)?)),
             None => Ok(None),
         }
@@ -1037,11 +958,11 @@ impl Lmdb {
 
     #[inline]
     pub(crate) fn is_deleted(&self, txn: &RoTxn, event_id: &EventId) -> Result<bool, Error> {
-        Ok(self.deleted_ids.get(txn, event_id.as_bytes())?.is_some())
+        Ok(self.deleted_ids.get(txn, &Scope::Default, event_id.as_bytes())?.is_some())
     }
 
     pub(crate) fn mark_deleted(&self, txn: &mut RwTxn, event_id: &EventId) -> Result<(), Error> {
-        self.deleted_ids.put(txn, event_id.as_bytes(), &())?;
+        self.deleted_ids.put(txn, &Scope::Default, event_id.as_bytes(), &[])?;
         Ok(())
     }
 
@@ -1052,7 +973,8 @@ impl Lmdb {
         when: Timestamp,
     ) -> Result<(), Error> {
         let key: Vec<u8> = index::make_coordinate_index_key(coordinate);
-        self.deleted_coordinates.put(txn, &key, &when.as_secs())?;
+        let when_bytes = when.as_secs().to_le_bytes();
+        self.deleted_coordinates.put(txn, &Scope::Default, &key, &when_bytes)?;
         Ok(())
     }
 
@@ -1064,8 +986,11 @@ impl Lmdb {
         let key: Vec<u8> = index::make_coordinate_index_key(coordinate);
         Ok(self
             .deleted_coordinates
-            .get(txn, &key)?
-            .map(Timestamp::from_secs))
+            .get(txn, &Scope::Default, &key)?
+            .map(|bytes| {
+                let timestamp_u64 = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                Timestamp::from_secs(timestamp_u64)
+            }))
     }
 
     pub(crate) fn ci_iter<'a>(
@@ -1073,14 +998,8 @@ impl Lmdb {
         txn: &'a RoTxn,
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix = index::make_ci_index_key(until, &EVENT_ID_ALL_ZEROS);
-        let end_prefix = index::make_ci_index_key(since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.ci_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.ci_iter_scoped(txn, &Scope::Default, since, until)
     }
 
     pub(crate) fn tc_iter<'a>(
@@ -1090,19 +1009,8 @@ impl Lmdb {
         tag_value: &str,
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix = index::make_tc_index_key(
-            tag_name,
-            tag_value,
-            until, // scan goes backwards in time
-            &EVENT_ID_ALL_ZEROS,
-        );
-        let end_prefix = index::make_tc_index_key(tag_name, tag_value, since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.tc_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.tc_iter_scoped(txn, &Scope::Default, tag_name, tag_value, since, until)
     }
 
     pub(crate) fn ac_iter<'a>(
@@ -1111,14 +1019,8 @@ impl Lmdb {
         author: &[u8; 32],
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix = index::make_ac_index_key(author, until, &EVENT_ID_ALL_ZEROS);
-        let end_prefix = index::make_ac_index_key(author, since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.ac_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.ac_iter_scoped(txn, &Scope::Default, author, since, until)
     }
 
     pub(crate) fn akc_iter<'a>(
@@ -1128,14 +1030,8 @@ impl Lmdb {
         kind: u16,
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix = index::make_akc_index_key(author, kind, until, &EVENT_ID_ALL_ZEROS);
-        let end_prefix = index::make_akc_index_key(author, kind, since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.akc_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.akc_iter_scoped(txn, &Scope::Default, author, kind, since, until)
     }
 
     pub(crate) fn atc_iter<'a>(
@@ -1146,21 +1042,8 @@ impl Lmdb {
         tag_value: &str,
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix: Vec<u8> = index::make_atc_index_key(
-            author,
-            tag_name,
-            tag_value,
-            until, // scan goes backwards in time
-            &EVENT_ID_ALL_ZEROS,
-        );
-        let end_prefix: Vec<u8> =
-            index::make_atc_index_key(author, tag_name, tag_value, since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.atc_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.atc_iter_scoped(txn, &Scope::Default, author, tag_name, tag_value, since, until)
     }
 
     fn handle_deletion_event(&self, txn: &mut RwTxn, event: &Event) -> Result<bool, Error> {
@@ -1215,21 +1098,8 @@ impl Lmdb {
         tag_value: &str,
         since: &Timestamp,
         until: &Timestamp,
-    ) -> Result<RoRange<'a, Bytes, Bytes>, Error> {
-        let start_prefix = index::make_ktc_index_key(
-            kind,
-            tag_name,
-            tag_value,
-            until, // scan goes backwards in time
-            &EVENT_ID_ALL_ZEROS,
-        );
-        let end_prefix =
-            index::make_ktc_index_key(kind, tag_name, tag_value, since, &EVENT_ID_ALL_255);
-        let range = (
-            Bound::Included(start_prefix.as_slice()),
-            Bound::Excluded(end_prefix.as_slice()),
-        );
-        Ok(self.ktc_index.range(txn, &range)?)
+    ) -> Result<ScopedIterator<'a>, Error> {
+        self.ktc_iter_scoped(txn, &Scope::Default, kind, tag_name, tag_value, since, until)
     }
 
     // ============================================================================
@@ -1263,7 +1133,7 @@ impl Lmdb {
         scope: &Scope,
         event_id: &[u8],
     ) -> Result<Option<EventBorrow<'a>>, Error> {
-        match self.events_scoped.get(txn, scope, event_id)? {
+        match self.events.get(txn, scope, event_id)? {
             Some(bytes) => Ok(Some(EventBorrow::decode(bytes)?)),
             None => Ok(None),
         }
@@ -1291,7 +1161,7 @@ impl Lmdb {
         event: &Event,
     ) -> Result<(), Error> {
         // Store event
-        self.events_scoped
+        self.events
             .put(txn, scope, event.id.as_bytes(), event.encode(fbb))?;
 
         // Index event
@@ -1306,19 +1176,19 @@ impl Lmdb {
         scope: &Scope,
         index: EventIndexKeys,
     ) -> Result<(), Error> {
-        self.ci_index_scoped
+        self.ci_index
             .put(txn, scope, &index.ci_index, &index.id)?;
-        self.akc_index_scoped
+        self.akc_index
             .put(txn, scope, &index.akc_index, &index.id)?;
-        self.ac_index_scoped
+        self.ac_index
             .put(txn, scope, &index.ac_index, &index.id)?;
 
         for tag in index.tags.into_iter() {
-            self.atc_index_scoped
+            self.atc_index
                 .put(txn, scope, &tag.atc_index, &index.id)?;
-            self.ktc_index_scoped
+            self.ktc_index
                 .put(txn, scope, &tag.ktc_index, &index.id)?;
-            self.tc_index_scoped
+            self.tc_index
                 .put(txn, scope, &tag.tc_index, &index.id)?;
         }
 
@@ -1331,16 +1201,16 @@ impl Lmdb {
         scope: &Scope,
         index: &EventIndexKeys,
     ) -> Result<(), Error> {
-        self.events_scoped.delete(txn, scope, &index.id)?;
-        self.ci_index_scoped.delete(txn, scope, &index.ci_index)?;
-        self.akc_index_scoped.delete(txn, scope, &index.akc_index)?;
-        self.ac_index_scoped.delete(txn, scope, &index.ac_index)?;
+        self.events.delete(txn, scope, &index.id)?;
+        self.ci_index.delete(txn, scope, &index.ci_index)?;
+        self.akc_index.delete(txn, scope, &index.akc_index)?;
+        self.ac_index.delete(txn, scope, &index.ac_index)?;
 
         // Delete tag indexes
         for tag in &index.tags {
-            self.atc_index_scoped.delete(txn, scope, &tag.atc_index)?;
-            self.ktc_index_scoped.delete(txn, scope, &tag.ktc_index)?;
-            self.tc_index_scoped.delete(txn, scope, &tag.tc_index)?;
+            self.atc_index.delete(txn, scope, &tag.atc_index)?;
+            self.ktc_index.delete(txn, scope, &tag.ktc_index)?;
+            self.tc_index.delete(txn, scope, &tag.tc_index)?;
         }
 
         Ok(())
@@ -1348,15 +1218,15 @@ impl Lmdb {
 
     /// Wipe all data in a scope
     pub(crate) fn wipe_scoped(&self, txn: &mut RwTxn, scope: &Scope) -> Result<(), Error> {
-        self.events_scoped.clear(txn, scope)?;
-        self.ci_index_scoped.clear(txn, scope)?;
-        self.tc_index_scoped.clear(txn, scope)?;
-        self.ac_index_scoped.clear(txn, scope)?;
-        self.akc_index_scoped.clear(txn, scope)?;
-        self.atc_index_scoped.clear(txn, scope)?;
-        self.ktc_index_scoped.clear(txn, scope)?;
-        self.deleted_ids_scoped.clear(txn, scope)?;
-        self.deleted_coordinates_scoped.clear(txn, scope)?;
+        self.events.clear(txn, scope)?;
+        self.ci_index.clear(txn, scope)?;
+        self.tc_index.clear(txn, scope)?;
+        self.ac_index.clear(txn, scope)?;
+        self.akc_index.clear(txn, scope)?;
+        self.atc_index.clear(txn, scope)?;
+        self.ktc_index.clear(txn, scope)?;
+        self.deleted_ids.clear(txn, scope)?;
+        self.deleted_coordinates.clear(txn, scope)?;
         Ok(())
     }
 
@@ -1369,7 +1239,7 @@ impl Lmdb {
         event_id: &EventId,
     ) -> Result<bool, Error> {
         Ok(self
-            .deleted_ids_scoped
+            .deleted_ids
             .get(txn, scope, event_id.as_bytes())?
             .is_some())
     }
@@ -1381,7 +1251,7 @@ impl Lmdb {
         scope: &Scope,
         event_id: &EventId,
     ) -> Result<(), Error> {
-        self.deleted_ids_scoped
+        self.deleted_ids
             .put(txn, scope, event_id.as_bytes(), &[])?;
         Ok(())
     }
@@ -1396,7 +1266,7 @@ impl Lmdb {
     ) -> Result<(), Error> {
         let key: Vec<u8> = index::make_coordinate_index_key(coordinate);
         let when_bytes = when.as_secs().to_le_bytes();
-        self.deleted_coordinates_scoped
+        self.deleted_coordinates
             .put(txn, scope, &key, &when_bytes)?;
         Ok(())
     }
@@ -1410,7 +1280,7 @@ impl Lmdb {
     ) -> Result<Option<Timestamp>, Error> {
         let key: Vec<u8> = index::make_coordinate_index_key(coordinate);
         Ok(self
-            .deleted_coordinates_scoped
+            .deleted_coordinates
             .get(txn, scope, &key)?
             .map(|bytes| {
                 let timestamp_u64 = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
@@ -2112,7 +1982,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.ci_index_scoped
+        self.ci_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
@@ -2132,7 +2002,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.tc_index_scoped
+        self.tc_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
@@ -2151,7 +2021,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.ac_index_scoped
+        self.ac_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
@@ -2171,7 +2041,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.akc_index_scoped
+        self.akc_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
@@ -2194,7 +2064,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.atc_index_scoped
+        self.atc_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
@@ -2217,7 +2087,7 @@ impl Lmdb {
             Bound::Included(start_prefix.as_slice()),
             Bound::Excluded(end_prefix.as_slice()),
         );
-        self.ktc_index_scoped
+        self.ktc_index
             .range(txn, scope, &range)
             .map_err(Error::from)
     }
