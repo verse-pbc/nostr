@@ -16,6 +16,7 @@ use flume::{Receiver, Sender};
 use heed::RwTxn;
 use nostr::{Event, Filter};
 use nostr_database::{FlatBufferBuilder, SaveEventStatus};
+use scoped_heed::Scope;
 use tokio::sync::oneshot;
 
 use super::error::Error;
@@ -105,6 +106,25 @@ enum IngesterOperation {
     Wipe {
         tx: Option<oneshot::Sender<Result<(), Error>>>,
     },
+    // Scoped operations for multi-tenant support
+    RegisterScope {
+        scope: Scope,
+        tx: Option<oneshot::Sender<Result<(), Error>>>,
+    },
+    SaveEventScoped {
+        event: Event,
+        scope: Scope,
+        tx: Option<oneshot::Sender<Result<SaveEventStatus, Error>>>,
+    },
+    DeleteScoped {
+        filter: Filter,
+        scope: Scope,
+        tx: Option<oneshot::Sender<Result<(), Error>>>,
+    },
+    WipeScoped {
+        scope: Scope,
+        tx: Option<oneshot::Sender<Result<(), Error>>>,
+    },
 }
 
 impl IngesterOperation {
@@ -124,6 +144,23 @@ impl IngesterOperation {
                 tx,
             },
             Self::Wipe { tx } => OperationResult::Wipe {
+                result: Err(error),
+                tx,
+            },
+            // Scoped operations use the same result types as their unscoped counterparts
+            Self::RegisterScope { tx, .. } => OperationResult::Wipe {
+                result: Err(error),
+                tx,
+            },
+            Self::SaveEventScoped { tx, .. } => OperationResult::Save {
+                result: Err(error),
+                tx,
+            },
+            Self::DeleteScoped { tx, .. } => OperationResult::Delete {
+                result: Err(error),
+                tx,
+            },
+            Self::WipeScoped { tx, .. } => OperationResult::Wipe {
                 result: Err(error),
                 tx,
             },
@@ -181,6 +218,68 @@ impl IngesterItem {
         };
         (item, rx)
     }
+
+    // Scoped operations for multi-tenant support
+
+    #[must_use]
+    pub(super) fn register_scope_with_feedback(
+        scope: Scope,
+    ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
+        let (tx, rx) = oneshot::channel();
+        let item: Self = Self {
+            operation: IngesterOperation::RegisterScope {
+                scope,
+                tx: Some(tx),
+            },
+        };
+        (item, rx)
+    }
+
+    #[must_use]
+    pub(super) fn save_event_scoped_with_feedback(
+        event: Event,
+        scope: Scope,
+    ) -> (Self, oneshot::Receiver<Result<SaveEventStatus, Error>>) {
+        let (tx, rx) = oneshot::channel();
+        let item: Self = Self {
+            operation: IngesterOperation::SaveEventScoped {
+                event,
+                scope,
+                tx: Some(tx),
+            },
+        };
+        (item, rx)
+    }
+
+    #[must_use]
+    pub(super) fn delete_scoped_with_feedback(
+        filter: Filter,
+        scope: Scope,
+    ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
+        let (tx, rx) = oneshot::channel();
+        let item: Self = Self {
+            operation: IngesterOperation::DeleteScoped {
+                filter,
+                scope,
+                tx: Some(tx),
+            },
+        };
+        (item, rx)
+    }
+
+    #[must_use]
+    pub(super) fn wipe_scoped_with_feedback(
+        scope: Scope,
+    ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
+        let (tx, rx) = oneshot::channel();
+        let item: Self = Self {
+            operation: IngesterOperation::WipeScoped {
+                scope,
+                tx: Some(tx),
+            },
+        };
+        (item, rx)
+    }
 }
 
 #[derive(Debug)]
@@ -190,21 +289,34 @@ pub(super) struct Ingester {
 }
 
 impl Ingester {
-    /// Build and spawn a new ingester
-    pub(super) fn run(db: Lmdb) -> Sender<IngesterItem> {
+    /// Build and spawn a new ingester with optional thread configuration
+    pub(super) fn run(
+        db: Lmdb,
+        thread_config: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Sender<IngesterItem> {
         // Create a new flume channel (unbounded for maximum performance)
         let (tx, rx) = flume::unbounded();
 
         // Construct and spawn ingester
         let ingester: Self = Self { db, rx };
-        ingester.spawn_ingester();
+        ingester.spawn_ingester(thread_config);
 
         tx
     }
 
     #[inline]
-    fn spawn_ingester(self) {
-        thread::spawn(move || self.run_ingester_loop());
+    fn spawn_ingester(self, thread_config: Option<Box<dyn FnOnce() + Send>>) {
+        thread::Builder::new()
+            .name("nostr-lmdb-ingester".into())
+            .spawn(move || {
+                // Apply thread configuration if provided (e.g., CPU affinity)
+                if let Some(config) = thread_config {
+                    config();
+                    tracing::info!("Ingester thread configuration applied");
+                }
+                self.run_ingester_loop()
+            })
+            .expect("Failed to spawn ingester thread");
     }
 
     fn run_ingester_loop(self) {
@@ -344,6 +456,23 @@ impl Ingester {
                 let result = self.db.wipe(txn);
                 OperationResult::Wipe { result, tx }
             }
+            // Scoped operations for multi-tenant support
+            IngesterOperation::RegisterScope { scope, tx } => {
+                let result = self.db.register_scope(txn, &scope);
+                OperationResult::Wipe { result, tx }
+            }
+            IngesterOperation::SaveEventScoped { event, scope, tx } => {
+                let result = self.db.save_event_with_txn_scoped(txn, &scope, fbb, &event);
+                OperationResult::Save { result, tx }
+            }
+            IngesterOperation::DeleteScoped { filter, scope, tx } => {
+                let result = self.db.delete_scoped(txn, &scope, filter);
+                OperationResult::Delete { result, tx }
+            }
+            IngesterOperation::WipeScoped { scope, tx } => {
+                let result = self.db.wipe_scoped(txn, &scope);
+                OperationResult::Wipe { result, tx }
+            }
         }
     }
 }
@@ -378,7 +507,7 @@ mod tests {
 
     async fn setup_test_store() -> (Arc<Store>, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let store = Store::open(temp_dir.path(), 1024 * 1024 * 10, 10, 50)
+        let store = Store::open(temp_dir.path(), 1024 * 1024 * 10, 10, 50, None)
             .await
             .expect("Failed to open test store");
         (Arc::new(store), temp_dir)
