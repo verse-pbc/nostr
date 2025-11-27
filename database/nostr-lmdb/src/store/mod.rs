@@ -6,11 +6,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_utility::task;
 use flume::Sender;
 use nostr_database::prelude::*;
 use scoped_heed::{GlobalScopeRegistry, Scope};
+use tracing::warn;
 
 mod error;
 mod filter;
@@ -20,6 +22,9 @@ mod lmdb;
 use self::error::Error;
 use self::ingester::{Ingester, IngesterItem};
 use self::lmdb::Lmdb;
+
+/// Threshold for logging slow database operations
+const SLOW_OP_THRESHOLD: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(super) struct Store {
@@ -59,14 +64,26 @@ impl Store {
     }
 
     #[inline]
-    async fn interact<F, R>(&self, f: F) -> Result<R, Error>
+    async fn interact<F, R>(&self, op_name: &'static str, f: F) -> Result<R, Error>
     where
         F: FnOnce(Lmdb) -> R + Send + 'static,
         R: Send + 'static,
     {
-        // TODO: is this clone cheap?
+        let start = Instant::now();
         let db = self.db.clone();
-        Ok(task::spawn_blocking(move || f(db)).await?)
+        let result = task::spawn_blocking(move || f(db)).await?;
+
+        let elapsed = start.elapsed();
+        if elapsed > SLOW_OP_THRESHOLD {
+            warn!(
+                target: "nostr_lmdb::slow_op",
+                operation = op_name,
+                duration_ms = elapsed.as_millis() as u64,
+                "Slow database operation detected"
+            );
+        }
+
+        Ok(result)
     }
 
     pub(crate) async fn reindex(&self) -> Result<(), Error> {
@@ -89,7 +106,7 @@ impl Store {
     }
 
     pub(super) async fn get_event_by_id(&self, id: EventId) -> Result<Option<Event>, Error> {
-        self.interact(move |db| {
+        self.interact("get_event_by_id", move |db| {
             let txn = db.read_txn()?;
             let event: Option<Event> = db
                 .get_event_by_id(&txn, id.as_bytes())?
@@ -101,7 +118,7 @@ impl Store {
     }
 
     pub(super) async fn check_id(&self, id: EventId) -> Result<DatabaseEventStatus, Error> {
-        self.interact(move |db| {
+        self.interact("check_id", move |db| {
             let txn = db.read_txn()?;
 
             let status: DatabaseEventStatus = if db.is_deleted(&txn, &id)? {
@@ -120,7 +137,7 @@ impl Store {
     }
 
     pub(super) async fn count(&self, filter: Filter) -> Result<usize, Error> {
-        self.interact(move |db| {
+        self.interact("count", move |db| {
             let txn = db.read_txn()?;
             let output = db.query(&txn, filter)?;
             let len: usize = output.count();
@@ -132,7 +149,7 @@ impl Store {
 
     // Lookup ID: EVENT_ORD_IMPL
     pub(super) async fn query(&self, filter: Filter) -> Result<Events, Error> {
-        self.interact(move |db| {
+        self.interact("query", move |db| {
             let mut events: Events = Events::new(&filter);
 
             let txn = db.read_txn()?;
@@ -149,7 +166,7 @@ impl Store {
         &self,
         filter: Filter,
     ) -> Result<Vec<(EventId, Timestamp)>, Error> {
-        self.interact(move |db| {
+        self.interact("negentropy_items", move |db| {
             let txn = db.read_txn()?;
             let events = db.query(&txn, filter)?;
             let items = events
@@ -190,7 +207,7 @@ impl Store {
 
     /// List all registered scopes (async version)
     pub(super) async fn list_scopes(&self) -> Result<Vec<Scope>, Error> {
-        self.interact(move |db| {
+        self.interact("list_scopes", move |db| {
             let txn = db.read_txn()?;
             let scopes = db.list_scopes(&txn)?;
             txn.commit()?;
@@ -237,7 +254,7 @@ impl Store {
         id: EventId,
         scope: Scope,
     ) -> Result<Option<Event>, Error> {
-        self.interact(move |db| {
+        self.interact("get_event_by_id_scoped", move |db| {
             let txn = db.read_txn()?;
             let event: Option<Event> = db
                 .get_event_by_id_scoped(&txn, &scope, id.as_bytes())?
@@ -254,7 +271,7 @@ impl Store {
         id: EventId,
         scope: Scope,
     ) -> Result<DatabaseEventStatus, Error> {
-        self.interact(move |db| {
+        self.interact("check_id_scoped", move |db| {
             let txn = db.read_txn()?;
 
             let status: DatabaseEventStatus = if db.is_deleted_scoped(&txn, &scope, &id)? {
@@ -274,7 +291,7 @@ impl Store {
 
     /// Count events matching a filter in a specific scope
     pub(super) async fn count_scoped(&self, filter: Filter, scope: Scope) -> Result<usize, Error> {
-        self.interact(move |db| {
+        self.interact("count_scoped", move |db| {
             let txn = db.read_txn()?;
             let output = db.query_scoped(&txn, &scope, filter)?;
             let len: usize = output.count();
@@ -286,7 +303,7 @@ impl Store {
 
     /// Query events matching a filter from a specific scope
     pub(super) async fn query_scoped(&self, filter: Filter, scope: Scope) -> Result<Events, Error> {
-        self.interact(move |db| {
+        self.interact("query_scoped", move |db| {
             let mut events: Events = Events::new(&filter);
 
             let txn = db.read_txn()?;
@@ -305,7 +322,7 @@ impl Store {
         filter: Filter,
         scope: Scope,
     ) -> Result<Vec<(EventId, Timestamp)>, Error> {
-        self.interact(move |db| {
+        self.interact("negentropy_items_scoped", move |db| {
             let txn = db.read_txn()?;
             let events = db.query_scoped(&txn, &scope, filter)?;
             let items = events
