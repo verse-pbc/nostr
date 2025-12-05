@@ -26,6 +26,64 @@ use self::lmdb::Lmdb;
 /// Threshold for logging slow database operations
 const SLOW_OP_THRESHOLD: Duration = Duration::from_millis(100);
 
+/// Summarize a filter for logging purposes
+fn summarize_filter(filter: &Filter) -> String {
+    let mut parts = Vec::new();
+
+    // IDs
+    let ids = filter.ids.as_ref().map(|s| s.len()).unwrap_or(0);
+    if ids > 0 {
+        parts.push(format!("ids:{}", ids));
+    }
+
+    // Authors
+    let authors = filter.authors.as_ref().map(|s| s.len()).unwrap_or(0);
+    if authors > 0 {
+        parts.push(format!("authors:{}", authors));
+    }
+
+    // Kinds
+    if let Some(kinds) = filter.kinds.as_ref() {
+        let kind_nums: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
+        if kind_nums.len() <= 5 {
+            parts.push(format!("kinds:{:?}", kind_nums));
+        } else {
+            parts.push(format!("kinds:[{}...]", kind_nums.len()));
+        }
+    }
+
+    // Tags (just count them)
+    let tag_count: usize = filter
+        .generic_tags
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
+    if tag_count > 0 {
+        let tag_keys: Vec<_> = filter.generic_tags.keys().collect();
+        parts.push(format!("tags:{}({:?})", tag_count, tag_keys));
+    }
+
+    // Time range
+    if filter.since.is_some() || filter.until.is_some() {
+        parts.push(format!(
+            "time:{:?}-{:?}",
+            filter.since.map(|t| t.as_secs()),
+            filter.until.map(|t| t.as_secs())
+        ));
+    }
+
+    // Limit
+    if let Some(limit) = filter.limit {
+        parts.push(format!("limit:{}", limit));
+    }
+
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Store {
     db: Lmdb,
@@ -86,6 +144,36 @@ impl Store {
         Ok(result)
     }
 
+    /// Variant of interact that logs filter details for slow query operations
+    #[inline]
+    async fn interact_query<F, R>(
+        &self,
+        op_name: &'static str,
+        filter_summary: String,
+        f: F,
+    ) -> Result<R, Error>
+    where
+        F: FnOnce(Lmdb) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let start = Instant::now();
+        let db = self.db.clone();
+        let result = task::spawn_blocking(move || f(db)).await?;
+
+        let elapsed = start.elapsed();
+        if elapsed > SLOW_OP_THRESHOLD {
+            warn!(
+                target: "nostr_lmdb::slow_op",
+                operation = op_name,
+                filter = %filter_summary,
+                duration_ms = elapsed.as_millis() as u64,
+                "Slow database operation detected"
+            );
+        }
+
+        Ok(result)
+    }
+
     pub(crate) async fn reindex(&self) -> Result<(), Error> {
         let (item, rx) = IngesterItem::reindex();
         self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
@@ -137,7 +225,8 @@ impl Store {
     }
 
     pub(super) async fn count(&self, filter: Filter) -> Result<usize, Error> {
-        self.interact("count", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("count", filter_summary, move |db| {
             let txn = db.read_txn()?;
             let output = db.query(&txn, filter)?;
             let len: usize = output.count();
@@ -149,7 +238,8 @@ impl Store {
 
     // Lookup ID: EVENT_ORD_IMPL
     pub(super) async fn query(&self, filter: Filter) -> Result<Events, Error> {
-        self.interact("query", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("query", filter_summary, move |db| {
             let mut events: Events = Events::new(&filter);
 
             let txn = db.read_txn()?;
@@ -166,7 +256,8 @@ impl Store {
         &self,
         filter: Filter,
     ) -> Result<Vec<(EventId, Timestamp)>, Error> {
-        self.interact("negentropy_items", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("negentropy_items", filter_summary, move |db| {
             let txn = db.read_txn()?;
             let events = db.query(&txn, filter)?;
             let items = events
@@ -291,7 +382,8 @@ impl Store {
 
     /// Count events matching a filter in a specific scope
     pub(super) async fn count_scoped(&self, filter: Filter, scope: Scope) -> Result<usize, Error> {
-        self.interact("count_scoped", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("count_scoped", filter_summary, move |db| {
             let txn = db.read_txn()?;
             let output = db.query_scoped(&txn, &scope, filter)?;
             let len: usize = output.count();
@@ -303,7 +395,8 @@ impl Store {
 
     /// Query events matching a filter from a specific scope
     pub(super) async fn query_scoped(&self, filter: Filter, scope: Scope) -> Result<Events, Error> {
-        self.interact("query_scoped", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("query_scoped", filter_summary, move |db| {
             let mut events: Events = Events::new(&filter);
 
             let txn = db.read_txn()?;
@@ -322,7 +415,8 @@ impl Store {
         filter: Filter,
         scope: Scope,
     ) -> Result<Vec<(EventId, Timestamp)>, Error> {
-        self.interact("negentropy_items_scoped", move |db| {
+        let filter_summary = summarize_filter(&filter);
+        self.interact_query("negentropy_items_scoped", filter_summary, move |db| {
             let txn = db.read_txn()?;
             let events = db.query_scoped(&txn, &scope, filter)?;
             let items = events
