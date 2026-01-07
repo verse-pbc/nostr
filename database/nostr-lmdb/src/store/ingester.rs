@@ -5,19 +5,23 @@
 //! Event ingester for LMDB storage backend
 //!
 //! This module implements an asynchronous event ingester that processes database operations
-//! in the background using a dedicated thread.
+//! in the background using tokio's spawn_blocking for LMDB operations.
 //!
 //! The ingester provides automatic batching of operations for optimal LMDB write performance.
 //! Events are collected from a channel and committed in batches using a single transaction.
+//!
+//! ## Architecture
+//!
+//! The ingester runs as a tokio task (not a std::thread) and uses spawn_blocking for the
+//! actual LMDB writes. This ensures that oneshot response channels are sent from within
+//! the tokio runtime context, avoiding cross-thread wake race conditions that can cause
+//! runtime deadlocks.
 
-use std::{iter, thread};
-
-use flume::{Receiver, Sender};
 use heed::RwTxn;
 use nostr::{Event, Filter};
 use nostr_database::{FlatBufferBuilder, SaveEventStatus};
 use scoped_heed::Scope;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::error::Error;
 use super::lmdb::Lmdb;
@@ -27,6 +31,9 @@ use super::lmdb::Lmdb;
 /// This size is chosen to handle most Nostr events without reallocation.
 /// Large events (with many tags or large content) may still trigger reallocation.
 const FLATBUFFER_CAPACITY: usize = 70_000;
+
+/// Maximum batch size to process in a single transaction
+const MAX_BATCH_SIZE: usize = 1000;
 
 enum OperationResult {
     Reindex {
@@ -282,197 +289,250 @@ impl IngesterItem {
     }
 }
 
+/// Sender handle for the ingester
+///
+/// This is a wrapper around mpsc::Sender that provides a synchronous send method
+/// for compatibility with the existing API.
+#[derive(Debug, Clone)]
+pub(super) struct IngesterSender {
+    tx: mpsc::UnboundedSender<IngesterItem>,
+}
+
+impl IngesterSender {
+    /// Send an item to the ingester
+    ///
+    /// This is non-blocking and will return an error if the ingester has shut down.
+    pub(super) fn send(&self, item: IngesterItem) -> Result<(), IngesterSendError> {
+        self.tx.send(item).map_err(|_| IngesterSendError)
+    }
+}
+
+/// Error returned when sending to the ingester fails
+#[derive(Debug)]
+pub(super) struct IngesterSendError;
+
+impl std::fmt::Display for IngesterSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ingester channel closed")
+    }
+}
+
+impl std::error::Error for IngesterSendError {}
+
 #[derive(Debug)]
 pub(super) struct Ingester {
     db: Lmdb,
-    rx: Receiver<IngesterItem>,
+    rx: mpsc::UnboundedReceiver<IngesterItem>,
 }
 
 impl Ingester {
-    /// Build and spawn a new ingester with optional thread configuration
+    /// Build and spawn a new ingester as a tokio task
+    ///
+    /// The `thread_config` parameter is ignored in this implementation since we use
+    /// tokio's spawn_blocking pool instead of a dedicated thread.
     pub(super) fn run(
         db: Lmdb,
-        thread_config: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Sender<IngesterItem> {
-        // Create a new flume channel (unbounded for maximum performance)
-        let (tx, rx) = flume::unbounded();
+        _thread_config: Option<Box<dyn FnOnce() + Send>>,
+    ) -> IngesterSender {
+        // Create a new unbounded mpsc channel
+        let (tx, rx) = mpsc::unbounded_channel();
 
-        // Construct and spawn ingester
-        let ingester: Self = Self { db, rx };
-        ingester.spawn_ingester(thread_config);
+        // Construct and spawn ingester as a tokio task
+        let ingester = Self { db, rx };
+        tokio::spawn(ingester.run_ingester_loop());
 
-        tx
+        IngesterSender { tx }
     }
 
-    #[inline]
-    fn spawn_ingester(self, thread_config: Option<Box<dyn FnOnce() + Send>>) {
-        thread::Builder::new()
-            .name("nostr-lmdb-ingester".into())
-            .spawn(move || {
-                // Apply thread configuration if provided (e.g., CPU affinity)
-                if let Some(config) = thread_config {
-                    config();
-                    tracing::info!("Ingester thread configuration applied");
-                }
-                self.run_ingester_loop()
-            })
-            .expect("Failed to spawn ingester thread");
-    }
-
-    fn run_ingester_loop(self) {
-        tracing::debug!("Ingester thread started");
-
-        let mut fbb: FlatBufferBuilder = FlatBufferBuilder::with_capacity(FLATBUFFER_CAPACITY);
-        let mut results: Vec<OperationResult> = Vec::new();
+    async fn run_ingester_loop(mut self) {
+        tracing::debug!("Ingester task started");
 
         loop {
-            // Recv the first item
-            let first_item: IngesterItem = match self.rx.recv() {
-                Ok(item) => item,
-                // All senders have been dropped, exit the loop
-                Err(flume::RecvError::Disconnected) => {
-                    tracing::debug!("Ingester channel disconnected, exiting.");
+            // Wait for the first item
+            let first_item = match self.rx.recv().await {
+                Some(item) => item,
+                // Channel closed, exit the loop
+                None => {
+                    tracing::debug!("Ingester channel closed, exiting.");
                     break;
                 }
             };
 
-            // Drain the rest of the channel into a batch
-            let batch = iter::once(first_item).chain(self.rx.drain());
+            // Collect more items without blocking (drain pattern)
+            let mut batch: Vec<IngesterItem> = Vec::with_capacity(64);
+            batch.push(first_item);
 
-            // Process batch, reusing the "results" vector
-            self.process_batch_in_transaction(batch, &mut fbb, &mut results);
+            // Try to collect more items that are already queued
+            while batch.len() < MAX_BATCH_SIZE {
+                match self.rx.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
+            }
 
-            tracing::debug!("Processed batch of {} operations", results.len());
+            let batch_size = batch.len();
 
-            // Drain the results and send them back through channels
-            for result in results.drain(..) {
+            // Process batch in spawn_blocking to avoid blocking the async runtime
+            let db = self.db.clone();
+            let results = tokio::task::spawn_blocking(move || {
+                process_batch_blocking(db, batch)
+            })
+            .await;
+
+            // Handle spawn_blocking result
+            let results = match results {
+                Ok(results) => results,
+                Err(e) => {
+                    tracing::error!(error = %e, "spawn_blocking panicked in ingester");
+                    continue;
+                }
+            };
+
+            tracing::debug!("Processed batch of {} operations", batch_size);
+
+            // Send results back through oneshot channels
+            // IMPORTANT: This happens from within the tokio task, not from a std::thread,
+            // which avoids the cross-thread wake race condition that causes deadlocks.
+            for result in results {
                 result.send();
             }
         }
 
-        tracing::debug!("Ingester thread exited");
+        tracing::debug!("Ingester task exited");
     }
+}
 
-    fn process_batch_in_transaction<I>(
-        &self,
-        batch: I,
-        fbb: &mut FlatBufferBuilder,
-        results: &mut Vec<OperationResult>,
-    ) where
-        I: Iterator<Item = IngesterItem>,
-    {
-        // Note: We're only using a write transaction here since LMDB doesn't require
-        // a separate read transaction for queries within a write transaction
-        let mut write_txn = match self.db.write_txn() {
-            Ok(txn) => txn,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create write transaction");
+/// Process a batch of operations in a blocking context
+///
+/// This function runs in spawn_blocking and performs the actual LMDB writes.
+fn process_batch_blocking(db: Lmdb, batch: Vec<IngesterItem>) -> Vec<OperationResult> {
+    let mut fbb = FlatBufferBuilder::with_capacity(FLATBUFFER_CAPACITY);
+    let mut results = Vec::with_capacity(batch.len());
 
-                // Send error for all items
-                for item in batch {
-                    results.push(
-                        item.operation
-                            .into_error_result(Error::BatchTransactionFailed),
-                    );
-                }
+    process_batch_in_transaction(&db, batch.into_iter(), &mut fbb, &mut results);
 
-                return;
+    results
+}
+
+fn process_batch_in_transaction<I>(
+    db: &Lmdb,
+    batch: I,
+    fbb: &mut FlatBufferBuilder,
+    results: &mut Vec<OperationResult>,
+) where
+    I: Iterator<Item = IngesterItem>,
+{
+    // Note: We're only using a write transaction here since LMDB doesn't require
+    // a separate read transaction for queries within a write transaction
+    let mut write_txn = match db.write_txn() {
+        Ok(txn) => txn,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create write transaction");
+
+            // Send error for all items
+            for item in batch {
+                results.push(
+                    item.operation
+                        .into_error_result(Error::BatchTransactionFailed),
+                );
             }
+
+            return;
+        }
+    };
+
+    let mut batch_iter = batch.peekable();
+
+    // Process all operations in the batch
+    while let Some(item) = batch_iter.next() {
+        let result = process_operation(db, &mut write_txn, item, fbb);
+
+        // Check if we need to abort on actual database errors (not on rejections)
+        let abort_on_error: bool = match &result {
+            OperationResult::Save { result: Err(e), .. } => {
+                tracing::error!(error = %e, "Failed to save event, aborting batch");
+                true
+            }
+            OperationResult::Delete { result: Err(e), .. } => {
+                tracing::error!(error = %e, "Failed to delete event, aborting batch");
+                true
+            }
+            OperationResult::Save {
+                result: Ok(SaveEventStatus::Rejected(_)),
+                ..
+            } => false, // Rejections are expected, don't abort
+            _ => false,
         };
 
-        let mut batch_iter = batch.peekable();
+        // Add operation to results
+        results.push(result);
 
-        // Process all operations in the batch
-        while let Some(item) = batch_iter.next() {
-            let result: OperationResult = self.process_operation(&mut write_txn, item, fbb);
-
-            // Check if we need to abort on actual database errors (not on rejections)
-            let abort_on_error: bool = match &result {
-                OperationResult::Save { result: Err(e), .. } => {
-                    tracing::error!(error = %e, "Failed to save event, aborting batch");
-                    true
-                }
-                OperationResult::Delete { result: Err(e), .. } => {
-                    tracing::error!(error = %e, "Failed to delete event, aborting batch");
-                    true
-                }
-                OperationResult::Save {
-                    result: Ok(SaveEventStatus::Rejected(_)),
-                    ..
-                } => false, // Rejections are expected, don't abort
-                _ => false,
-            };
-
-            // Add operation to results
-            results.push(result);
-
-            if abort_on_error {
-                // Mark all previous operations as failed
-                mark_all_as_failed(results);
-
-                // All remaining operations get BatchTransactionFailed error
-                for item in batch_iter {
-                    results.push(
-                        item.operation
-                            .into_error_result(Error::BatchTransactionFailed),
-                    );
-                }
-
-                // Abort the write transaction first, then drop read transaction
-                write_txn.abort();
-                return;
-            }
-        }
-
-        // All operations succeeded, commit the transaction
-        if let Err(e) = write_txn.commit() {
-            tracing::error!(error = %e, "Failed to commit batch transaction");
-
-            // Mark all operations as failed
+        if abort_on_error {
+            // Mark all previous operations as failed
             mark_all_as_failed(results);
+
+            // All remaining operations get BatchTransactionFailed error
+            for item in batch_iter {
+                results.push(
+                    item.operation
+                        .into_error_result(Error::BatchTransactionFailed),
+                );
+            }
+
+            // Abort the write transaction
+            write_txn.abort();
+            return;
         }
     }
 
-    fn process_operation(
-        &self,
-        txn: &mut RwTxn,
-        item: IngesterItem,
-        fbb: &mut FlatBufferBuilder,
-    ) -> OperationResult {
-        match item.operation {
-            IngesterOperation::Reindex { tx } => OperationResult::Reindex {
-                result: self.db.reindex(txn),
-                tx,
-            },
-            IngesterOperation::SaveEvent { event, tx } => {
-                let result = self.db.save_event_with_txn(txn, fbb, &event);
-                OperationResult::Save { result, tx }
-            }
-            IngesterOperation::Delete { filter, tx } => {
-                let result = self.db.delete(txn, filter);
-                OperationResult::Delete { result, tx }
-            }
-            IngesterOperation::Wipe { tx } => {
-                let result = self.db.wipe(txn);
-                OperationResult::Wipe { result, tx }
-            }
-            // Scoped operations for multi-tenant support
-            IngesterOperation::RegisterScope { scope, tx } => {
-                let result = self.db.register_scope(txn, &scope);
-                OperationResult::Wipe { result, tx }
-            }
-            IngesterOperation::SaveEventScoped { event, scope, tx } => {
-                let result = self.db.save_event_with_txn_scoped(txn, &scope, fbb, &event);
-                OperationResult::Save { result, tx }
-            }
-            IngesterOperation::DeleteScoped { filter, scope, tx } => {
-                let result = self.db.delete_scoped(txn, &scope, filter);
-                OperationResult::Delete { result, tx }
-            }
-            IngesterOperation::WipeScoped { scope, tx } => {
-                let result = self.db.wipe_scoped(txn, &scope);
-                OperationResult::Wipe { result, tx }
-            }
+    // All operations succeeded, commit the transaction
+    if let Err(e) = write_txn.commit() {
+        tracing::error!(error = %e, "Failed to commit batch transaction");
+
+        // Mark all operations as failed
+        mark_all_as_failed(results);
+    }
+}
+
+fn process_operation(
+    db: &Lmdb,
+    txn: &mut RwTxn,
+    item: IngesterItem,
+    fbb: &mut FlatBufferBuilder,
+) -> OperationResult {
+    match item.operation {
+        IngesterOperation::Reindex { tx } => OperationResult::Reindex {
+            result: db.reindex(txn),
+            tx,
+        },
+        IngesterOperation::SaveEvent { event, tx } => {
+            let result = db.save_event_with_txn(txn, fbb, &event);
+            OperationResult::Save { result, tx }
+        }
+        IngesterOperation::Delete { filter, tx } => {
+            let result = db.delete(txn, filter);
+            OperationResult::Delete { result, tx }
+        }
+        IngesterOperation::Wipe { tx } => {
+            let result = db.wipe(txn);
+            OperationResult::Wipe { result, tx }
+        }
+        // Scoped operations for multi-tenant support
+        IngesterOperation::RegisterScope { scope, tx } => {
+            let result = db.register_scope(txn, &scope);
+            OperationResult::Wipe { result, tx }
+        }
+        IngesterOperation::SaveEventScoped { event, scope, tx } => {
+            let result = db.save_event_with_txn_scoped(txn, &scope, fbb, &event);
+            OperationResult::Save { result, tx }
+        }
+        IngesterOperation::DeleteScoped { filter, scope, tx } => {
+            let result = db.delete_scoped(txn, &scope, filter);
+            OperationResult::Delete { result, tx }
+        }
+        IngesterOperation::WipeScoped { scope, tx } => {
+            let result = db.wipe_scoped(txn, &scope);
+            OperationResult::Wipe { result, tx }
         }
     }
 }

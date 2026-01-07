@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_utility::task;
-use flume::Sender;
 use nostr_database::prelude::*;
 use scoped_heed::{GlobalScopeRegistry, Scope};
 use tracing::warn;
@@ -20,7 +19,7 @@ mod ingester;
 mod lmdb;
 
 use self::error::Error;
-use self::ingester::{Ingester, IngesterItem};
+use self::ingester::{Ingester, IngesterItem, IngesterSender};
 use self::lmdb::Lmdb;
 
 /// Threshold for logging slow database operations
@@ -87,7 +86,7 @@ fn summarize_filter(filter: &Filter) -> String {
 #[derive(Debug)]
 pub(super) struct Store {
     db: Lmdb,
-    ingester: Sender<IngesterItem>,
+    ingester: IngesterSender,
 }
 
 impl Store {
@@ -115,7 +114,7 @@ impl Store {
         .await??;
 
         // Run the ingester with optional thread configuration
-        let ingester: Sender<IngesterItem> =
+        let ingester: IngesterSender =
             Ingester::run(db.clone(), ingester_thread_config);
 
         Ok(Self { db, ingester })
@@ -176,20 +175,20 @@ impl Store {
 
     pub(crate) async fn reindex(&self) -> Result<(), Error> {
         let (item, rx) = IngesterItem::reindex();
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
     pub(super) async fn save_event(&self, event: &Event) -> Result<SaveEventStatus, Error> {
         let (item, rx) = IngesterItem::save_event_with_feedback(event.clone());
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
     /// Save an event (owned version that avoids cloning)
     pub(super) async fn save_event_owned(&self, event: Event) -> Result<SaveEventStatus, Error> {
         let (item, rx) = IngesterItem::save_event_with_feedback(event);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
@@ -272,13 +271,13 @@ impl Store {
 
     pub(super) async fn delete(&self, filter: Filter) -> Result<(), Error> {
         let (item, rx) = IngesterItem::delete_with_feedback(filter);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
     pub(super) async fn wipe(&self) -> Result<(), Error> {
         let (item, rx) = IngesterItem::wipe_with_feedback();
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
@@ -292,7 +291,7 @@ impl Store {
     /// Register a new scope in the database
     pub(super) async fn register_scope(&self, scope: Scope) -> Result<(), Error> {
         let (item, rx) = IngesterItem::register_scope_with_feedback(scope);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
@@ -324,7 +323,7 @@ impl Store {
         scope: Scope,
     ) -> Result<SaveEventStatus, Error> {
         let (item, rx) = IngesterItem::save_event_scoped_with_feedback(event.clone(), scope);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
@@ -335,7 +334,7 @@ impl Store {
         scope: Scope,
     ) -> Result<SaveEventStatus, Error> {
         let (item, rx) = IngesterItem::save_event_scoped_with_feedback(event, scope);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
@@ -432,14 +431,14 @@ impl Store {
     /// Delete events matching a filter from a specific scope
     pub(super) async fn delete_scoped(&self, filter: Filter, scope: Scope) -> Result<(), Error> {
         let (item, rx) = IngesterItem::delete_scoped_with_feedback(filter, scope);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 
     /// Wipe all data from a specific scope
     pub(super) async fn wipe_scoped(&self, scope: Scope) -> Result<(), Error> {
         let (item, rx) = IngesterItem::wipe_scoped_with_feedback(scope);
-        self.ingester.send(item).map_err(|_| Error::FlumeSend)?;
+        self.ingester.send(item)?;
         rx.await?
     }
 }

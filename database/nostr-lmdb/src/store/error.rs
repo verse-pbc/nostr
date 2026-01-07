@@ -103,3 +103,9 @@ impl From<ScopedDbError> for Error {
         Self::ScopedDb(e)
     }
 }
+
+impl From<super::ingester::IngesterSendError> for Error {
+    fn from(_: super::ingester::IngesterSendError) -> Self {
+        Self::FlumeSend
+    }
+}
