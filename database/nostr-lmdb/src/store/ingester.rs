@@ -347,6 +347,9 @@ impl Ingester {
     async fn run_ingester_loop(mut self) {
         tracing::debug!("Ingester task started");
 
+        // Reusable batch buffer - allocated once, reused across iterations
+        let mut batch: Vec<IngesterItem> = Vec::with_capacity(64);
+
         loop {
             // Wait for the first item
             let first_item = match self.rx.recv().await {
@@ -358,8 +361,8 @@ impl Ingester {
                 }
             };
 
-            // Collect more items without blocking (drain pattern)
-            let mut batch: Vec<IngesterItem> = Vec::with_capacity(64);
+            // Clear and reuse batch from previous iteration
+            batch.clear();
             batch.push(first_item);
 
             // Try to collect more items that are already queued
@@ -372,21 +375,29 @@ impl Ingester {
 
             let batch_size = batch.len();
 
+            // Take the batch for processing, leaving empty vec in place
+            let batch_to_process = std::mem::take(&mut batch);
+
             // Process batch in spawn_blocking to avoid blocking the async runtime
             let db = self.db.clone();
-            let results = tokio::task::spawn_blocking(move || {
-                process_batch_blocking(db, batch)
+            let spawn_result = tokio::task::spawn_blocking(move || {
+                process_batch_blocking(db, batch_to_process)
             })
             .await;
 
             // Handle spawn_blocking result
-            let results = match results {
-                Ok(results) => results,
+            let (results, returned_batch) = match spawn_result {
+                Ok((results, returned_batch)) => (results, returned_batch),
                 Err(e) => {
                     tracing::error!(error = %e, "spawn_blocking panicked in ingester");
+                    // Lost the batch allocation, recreate
+                    batch = Vec::with_capacity(64);
                     continue;
                 }
             };
+
+            // Restore the batch for reuse (retains capacity)
+            batch = returned_batch;
 
             tracing::debug!("Processed batch of {} operations", batch_size);
 
@@ -405,13 +416,17 @@ impl Ingester {
 /// Process a batch of operations in a blocking context
 ///
 /// This function runs in spawn_blocking and performs the actual LMDB writes.
-fn process_batch_blocking(db: Lmdb, batch: Vec<IngesterItem>) -> Vec<OperationResult> {
+/// Returns both results and the drained batch Vec for reuse.
+fn process_batch_blocking(
+    db: Lmdb,
+    mut batch: Vec<IngesterItem>,
+) -> (Vec<OperationResult>, Vec<IngesterItem>) {
     let mut fbb = FlatBufferBuilder::with_capacity(FLATBUFFER_CAPACITY);
     let mut results = Vec::with_capacity(batch.len());
 
-    process_batch_in_transaction(&db, batch.into_iter(), &mut fbb, &mut results);
+    process_batch_in_transaction(&db, batch.drain(..), &mut fbb, &mut results);
 
-    results
+    (results, batch)
 }
 
 fn process_batch_in_transaction<I>(
